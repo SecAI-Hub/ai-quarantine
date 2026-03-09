@@ -96,6 +96,7 @@ result = run_pipeline(
 export QUARANTINE_DIR=/data/quarantine
 export REGISTRY_DIR=/data/registry
 export REGISTRY_URL=http://127.0.0.1:8470
+export SERVICE_TOKEN_PATH=/run/secure-ai/service-token
 ai-quarantine
 ```
 
@@ -103,11 +104,16 @@ ai-quarantine
 
 ```bash
 docker build -f Containerfile -t ai-quarantine .
-docker run -v /data/quarantine:/quarantine \
+docker run --network=host \
+           -v /data/quarantine:/quarantine \
            -v /data/registry:/registry \
-           -e REGISTRY_URL=http://registry:8470 \
+           -e REGISTRY_URL=http://127.0.0.1:8470 \
+           -e SERVICE_TOKEN_PATH=/run/secrets/registry-token \
+           -v /path/to/token:/run/secrets/registry-token:ro \
            ai-quarantine
 ```
+
+> **Note:** The quarantine watcher communicates with the registry over HTTP. Use `127.0.0.1` (localhost) to ensure traffic stays on the loopback interface. Never expose the registry on a remote address without TLS.
 
 ## Configuration
 
