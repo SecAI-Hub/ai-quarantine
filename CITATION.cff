@@ -1,0 +1,19 @@
+cff-version: 1.2.0
+title: ai-quarantine
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - name: SecAI-Hub
+repository-code: "https://github.com/SecAI-Hub/ai-quarantine"
+license: Apache-2.0
+version: 0.1.0
+date-released: "2026-03-09"
+keywords:
+  - ai-safety
+  - model-scanning
+  - quarantine
+  - artifact-verification
+  - supply-chain-security
+  - llm-security
+  - gguf
+  - safetensors

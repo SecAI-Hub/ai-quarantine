@@ -1,0 +1,38 @@
+# ai-quarantine
+
+> Seven-stage AI artifact admission-control pipeline
+
+## What this project does
+
+ai-quarantine is a Python library and service that verifies, scans, and
+smoke-tests AI model artifacts (GGUF, safetensors, diffusion directories)
+before promoting them to a trusted registry.
+
+## Architecture
+
+- quarantine/pipeline.py — core 7-stage scanning pipeline (1,900 lines)
+- quarantine/watcher.py — filesystem watcher that runs pipeline on new artifacts
+- quarantine/audit_chain.py — hash-chained append-only audit log
+
+## Pipeline stages
+
+1. Source policy gate: verify origin URL against allowlist
+2. Format gate: validate magic bytes, reject pickle/pt/bin
+3. Integrity gate: SHA-256 hash pinning
+4. Provenance gate: cosign signature verification
+5. Static scan: modelscan + fickling + entropy + weight stats + gguf-guard
+6. Behavioral smoke test: 41 adversarial prompts + garak (GGUF only)
+7. Diffusion deep scan: config integrity validation
+
+## Key types
+
+- run_pipeline(path, hash, policy) -> {"passed": bool, "reason": str, "details": dict}
+- run_pipeline_directory(path, hash, policy) -> same
+- AuditChain(log_path) — hash-chained audit logger
+
+## Integration
+
+- Uses modelscan, fickling, garak, gguf-guard as optional external scanners
+- Promotes artifacts to ai-model-registry via HTTP API
+- Watcher mode polls a directory for new artifacts
+- Container deployment via Containerfile

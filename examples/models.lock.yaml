@@ -1,0 +1,16 @@
+version: 1
+
+# Pinned model artifacts. Each entry records the verified SHA-256 hash.
+# Remote downloads are rejected unless they match a pin here.
+# Local imports use trust-on-first-use (TOFU) but must be pinned
+# before subsequent promotions.
+
+models: []
+  # Example:
+  # - name: "mistral-7b-instruct-v0.3"
+  #   format: "gguf"
+  #   source: "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.3-GGUF"
+  #   filename: "mistral-7b-instruct-v0.3.Q5_K_M.gguf"
+  #   sha256: ""
+  #   size_bytes: 0
+  #   promoted_at: ""

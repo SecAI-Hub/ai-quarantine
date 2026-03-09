@@ -1,0 +1,18 @@
+FROM docker.io/library/python:3.12-slim@sha256:ccc7089399c8bb65dd1fb3ed6d55efa538a3f5e7fca3f5988ac3b5b87e593bf0
+
+WORKDIR /app
+COPY pyproject.toml .
+COPY requirements.lock .
+COPY quarantine/ quarantine/
+
+RUN pip install --no-cache-dir --require-hashes -r requirements.lock && \
+    pip install --no-cache-dir --no-deps .
+
+# Install scanning tools — each independently so one failure doesn't block others
+RUN pip install --no-cache-dir modelscan || echo "WARN: modelscan not available"
+RUN pip install --no-cache-dir fickling || echo "WARN: fickling not available"
+RUN pip install --no-cache-dir garak || echo "WARN: garak not available"
+RUN pip install --no-cache-dir modelaudit || echo "WARN: modelaudit not available"
+
+USER 65534:65534
+ENTRYPOINT ["ai-quarantine"]

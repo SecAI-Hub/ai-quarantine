@@ -1,0 +1,37 @@
+[project]
+name = "ai-quarantine"
+version = "0.1.0"
+description = "Seven-stage AI artifact admission-control pipeline"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+keywords = [
+    "ai-safety",
+    "model-scanning",
+    "quarantine",
+    "artifact-verification",
+    "supply-chain-security",
+    "llm-security",
+    "gguf",
+    "safetensors",
+]
+dependencies = [
+    "pyyaml>=6.0",
+    "watchdog>=4.0",
+]
+
+[project.optional-dependencies]
+scan = [
+    "modelscan>=0.8",
+    "fickling>=0.1",
+    "garak>=0.9",
+]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+ai-quarantine = "quarantine.watcher:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,28 @@
+version: 1
+
+models:
+  allowed_formats: ["gguf", "safetensors"]
+  deny_formats: ["pickle", "pt", "bin"]
+  require_scan: true
+  require_behavior_tests: true
+  require_source_verification: true
+  require_entropy_analysis: true
+  allow_diffusion_directories: true
+
+quarantine:
+  stages:
+    source_policy: true
+    format_gate: true
+    integrity_check: true
+    provenance_check: true
+    static_scan: true
+    behavioral_test: true
+    diffusion_deep_scan: true
+  smoke_test_max_score: 0.3
+  smoke_test_max_critical: 1
+
+gguf_guard:
+  required: false
+  generate_manifest: true
+  generate_fingerprint: true
+  verify_on_integrity_check: true
