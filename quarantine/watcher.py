@@ -41,9 +41,28 @@ REGISTRY_DIR = Path(os.getenv("REGISTRY_DIR", "/registry"))
 REGISTRY_URL = os.getenv("REGISTRY_URL", "http://127.0.0.1:8470")
 POLICY_PATH = Path(os.getenv("POLICY_PATH", "/etc/secure-ai/policy/policy.yaml"))
 AUDIT_LOG_PATH = Path(os.getenv("AUDIT_LOG_PATH", "/var/lib/secure-ai/logs/quarantine-audit.jsonl"))
+SERVICE_TOKEN_PATH = os.getenv("SERVICE_TOKEN_PATH", "")
 
 ALLOWED_EXTENSIONS = {".gguf", ".safetensors"}
 DENIED_EXTENSIONS = {".pkl", ".pickle", ".pt", ".bin"}
+
+
+def _load_service_token() -> str:
+    """Load the service token for authenticated registry promotion.
+
+    Reads from the SERVICE_TOKEN environment variable first.  Falls back to
+    reading the file at SERVICE_TOKEN_PATH if set.  Returns an empty string
+    when no token is configured (unauthenticated mode).
+    """
+    token = os.getenv("SERVICE_TOKEN", "")
+    if token:
+        return token.strip()
+    if SERVICE_TOKEN_PATH:
+        try:
+            return Path(SERVICE_TOKEN_PATH).read_text().strip()
+        except OSError as e:
+            log.warning("could not read SERVICE_TOKEN_PATH (%s): %s", SERVICE_TOKEN_PATH, e)
+    return ""
 
 # Hash-chained audit log instance
 _audit_chain = AuditChain(str(AUDIT_LOG_PATH))
@@ -162,10 +181,14 @@ def promote_to_registry(filename: str, file_hash: str, size_bytes: int,
             payload["gguf_guard_manifest"] = manifest_info.get("manifest_path", "")
 
     try:
+        headers = {"Content-Type": "application/json"}
+        token = _load_service_token()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
         req = Request(
             f"{REGISTRY_URL}/v1/model/promote",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urlopen(req, timeout=30) as resp:

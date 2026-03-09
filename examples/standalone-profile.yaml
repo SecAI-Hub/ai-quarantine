@@ -1,10 +1,17 @@
+# Standalone deployment profile — for CI pipelines, developer workstations,
+# or environments where llama-server is not available.
+#
+# All stages enabled, but behavioral smoke tests are optional (no llama-server
+# assumed). gguf-guard is recommended but not required. Missing optional
+# scanners produce warnings instead of hard failures.
+
 version: 1
 
 models:
   allowed_formats: ["gguf", "safetensors"]
   deny_formats: ["pickle", "pt", "bin"]
   require_scan: true
-  require_behavior_tests: true
+  require_behavior_tests: false
   require_source_verification: true
   require_entropy_analysis: true
   allow_diffusion_directories: true
@@ -20,10 +27,18 @@ quarantine:
     diffusion_deep_scan: true
   smoke_test_max_score: 0.3
   smoke_test_max_critical: 1
-  scanner_missing: fail-closed
+  scanner_missing: warn-and-skip
 
 gguf_guard:
   required: false
   generate_manifest: true
   generate_fingerprint: true
   verify_on_integrity_check: true
+
+registry:
+  url: "http://127.0.0.1:8470"
+  localhost_only: false
+
+network:
+  offline_by_default: false
+  allow_outbound: true

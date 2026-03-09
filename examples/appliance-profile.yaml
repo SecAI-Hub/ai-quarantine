@@ -1,3 +1,9 @@
+# Appliance deployment profile — for use with SecAI_OS or similar
+# immutable-OS, air-gapped, local-only AI appliances.
+#
+# All stages enabled, fail-closed for missing scanners, no retained
+# raw artifacts after scan. Designed for maximum security posture.
+
 version: 1
 
 models:
@@ -21,9 +27,18 @@ quarantine:
   smoke_test_max_score: 0.3
   smoke_test_max_critical: 1
   scanner_missing: fail-closed
+  retain_raw_artifacts: false
 
 gguf_guard:
-  required: false
+  required: true
   generate_manifest: true
   generate_fingerprint: true
   verify_on_integrity_check: true
+
+registry:
+  url: "http://127.0.0.1:8470"
+  localhost_only: true
+
+network:
+  offline_by_default: true
+  allow_outbound: false
