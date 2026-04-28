@@ -5,13 +5,9 @@ import struct
 from pathlib import Path
 from unittest.mock import patch
 
-import pytest
-
 from quarantine.pipeline import (
     DANGER_PATTERNS,
     SMOKE_PROMPTS,
-    WEIGHT_STATS_MAX_KURTOSIS,
-    WEIGHT_STATS_MAX_ZERO_FRACTION,
     _analyze_weight_distribution,
     _check_file_entropy,
     _check_jinja_template,
@@ -40,6 +36,11 @@ from quarantine.pipeline import (
     run_pipeline,
     run_pipeline_directory,
     sha256_of_directory,
+)
+from quarantine.watcher import (
+    _enable_fsverity,
+    _stage_gguf_guard_manifest,
+    _write_provenance_manifest,
 )
 
 
@@ -428,7 +429,12 @@ class TestDiffusionDeepScan:
 
     def test_symlink_flagged(self, tmp_path):
         d = make_diffusion_dir(tmp_path, "with-symlink")
-        (d / "unet" / "link.txt").symlink_to("/etc/passwd")
+        try:
+            (d / "unet" / "link.txt").symlink_to("/etc/passwd")
+        except OSError as exc:
+            import pytest
+
+            pytest.skip(f"symlinks unavailable: {exc}")
         result = check_diffusion_config_integrity(d)
         assert not result["passed"]
         assert any("symlink" in i for i in result["issues"])
@@ -683,14 +689,29 @@ class TestExpandedAdversarialSuite:
         assert required.issubset(categories), f"missing: {required - categories}"
 
 
-# ---------------------------------------------------------------------------
-# Provenance manifest & fs-verity
-# ---------------------------------------------------------------------------
-
-from quarantine.watcher import _write_provenance_manifest, _enable_fsverity
-
-
 class TestProvenanceManifest:
+    def test_stages_gguf_guard_manifest_in_registry(self, tmp_path, monkeypatch):
+        """Generated GGUF guard manifests are moved into the registry namespace."""
+        import quarantine.watcher as watcher_mod
+
+        registry_dir = tmp_path / "registry"
+        registry_dir.mkdir()
+        manifest_path = tmp_path / "model.gguf.gguf-guard.json"
+        manifest_path.write_text("{}")
+        details = {
+            "gguf_guard_manifest": {
+                "generated": True,
+                "manifest_path": str(manifest_path),
+            }
+        }
+
+        monkeypatch.setattr(watcher_mod, "REGISTRY_DIR", registry_dir)
+
+        _stage_gguf_guard_manifest(details)
+
+        assert (registry_dir / manifest_path.name).exists()
+        assert details["gguf_guard_manifest"]["manifest_path"] == manifest_path.name
+
     def test_creates_valid_json(self, tmp_path, monkeypatch):
         """_write_provenance_manifest creates a valid JSON file with all fields."""
         import quarantine.watcher as watcher_mod

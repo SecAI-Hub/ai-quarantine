@@ -38,11 +38,21 @@ import subprocess
 import time
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import yaml
 
 log = logging.getLogger("quarantine.pipeline")
+
+
+def _http_urlopen(target, timeout: int = 30):
+    """Open only HTTP(S) URLs for scanner-local service calls."""
+    raw_url = target.full_url if isinstance(target, Request) else str(target)
+    scheme = urlparse(raw_url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise URLError(f"unsupported URL scheme: {scheme or 'none'}")
+    return urlopen(target, timeout=timeout)  # nosec B310
 
 MODELS_LOCK_PATH = Path(
     os.getenv("MODELS_LOCK_PATH", "/etc/secure-ai/policy/models.lock.yaml")
@@ -340,8 +350,8 @@ def _scan_gguf_chat_template(filepath: Path) -> dict:
             if magic != b"GGUF":
                 return {"passed": True, "note": "not a GGUF file"}
 
-            version = struct.unpack("<I", f.read(4))[0]
-            tensor_count = struct.unpack("<Q", f.read(8))[0]
+            _version = struct.unpack("<I", f.read(4))[0]
+            _tensor_count = struct.unpack("<Q", f.read(8))[0]
             metadata_count = struct.unpack("<Q", f.read(8))[0]
 
             # Parse metadata KV pairs looking for chat template
@@ -1440,7 +1450,7 @@ def _query_llama(port: int, prompt_messages: list, timeout: int = 60) -> str:
         method="POST",
     )
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with _http_urlopen(req, timeout=timeout) as resp:
             data = json.loads(resp.read())
             return data.get("choices", [{}])[0].get("message", {}).get("content", "")
     except (URLError, OSError, json.JSONDecodeError, KeyError) as e:

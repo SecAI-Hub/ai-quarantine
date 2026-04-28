@@ -23,6 +23,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 import yaml
@@ -63,6 +64,15 @@ def _load_service_token() -> str:
         except OSError as e:
             log.warning("could not read SERVICE_TOKEN_PATH (%s): %s", SERVICE_TOKEN_PATH, e)
     return ""
+
+
+def _http_urlopen(target, timeout: int = 30):
+    """Open only HTTP(S) URLs for registry service calls."""
+    raw_url = target.full_url if isinstance(target, Request) else str(target)
+    scheme = urlparse(raw_url).scheme.lower()
+    if scheme not in {"http", "https"}:
+        raise URLError(f"unsupported URL scheme: {scheme or 'none'}")
+    return urlopen(target, timeout=timeout)  # nosec B310
 
 # Hash-chained audit log instance
 _audit_chain = AuditChain(str(AUDIT_LOG_PATH))
@@ -138,6 +148,37 @@ def _compute_policy_version() -> dict:
         return {"hash": "unreadable"}
 
 
+def _stage_gguf_guard_manifest(pipeline_details: dict | None) -> None:
+    """Move a generated GGUF guard manifest into the registry directory."""
+    if not pipeline_details:
+        return
+    manifest_info = pipeline_details.get("gguf_guard_manifest", {})
+    if not isinstance(manifest_info, dict) or not manifest_info.get("generated"):
+        return
+    manifest_path = manifest_info.get("manifest_path")
+    if not manifest_path:
+        return
+
+    source = Path(manifest_path)
+    dest = REGISTRY_DIR / source.name
+    try:
+        if source.resolve() != dest.resolve():
+            if not source.exists():
+                log.warning("gguf-guard manifest missing before registry promotion: %s", source)
+                manifest_info["generated"] = False
+                manifest_info["manifest_path"] = ""
+                return
+            shutil.move(str(source), str(dest))
+            log.info("moved gguf-guard manifest to registry dir: %s", dest.name)
+    except OSError as e:
+        log.warning("could not stage gguf-guard manifest %s: %s", source, e)
+        manifest_info["generated"] = False
+        manifest_info["manifest_path"] = ""
+        return
+
+    manifest_info["manifest_path"] = dest.name
+
+
 def promote_to_registry(filename: str, file_hash: str, size_bytes: int,
                         scan_results: dict, model_type: str = "llm",
                         source_url: str = "",
@@ -177,8 +218,9 @@ def promote_to_registry(filename: str, file_hash: str, size_bytes: int,
         if fp:
             payload["gguf_guard_fingerprint"] = fp
         manifest_info = pipeline_details.get("gguf_guard_manifest", {})
-        if manifest_info.get("generated"):
-            payload["gguf_guard_manifest"] = manifest_info.get("manifest_path", "")
+        manifest_path = manifest_info.get("manifest_path", "")
+        if manifest_info.get("generated") and manifest_path:
+            payload["gguf_guard_manifest"] = Path(manifest_path).name
 
     try:
         headers = {"Content-Type": "application/json"}
@@ -191,7 +233,7 @@ def promote_to_registry(filename: str, file_hash: str, size_bytes: int,
             headers=headers,
             method="POST",
         )
-        with urlopen(req, timeout=30) as resp:
+        with _http_urlopen(req, timeout=30) as resp:
             result = json.loads(resp.read())
             log.info("registry promotion response: %s", result)
             return resp.status == 201
@@ -258,6 +300,7 @@ def process_artifact(artifact_path: Path) -> bool:
 
     # Collect scan result summary
     details = result.get("details", {})
+    _stage_gguf_guard_manifest(details)
     scan_summary = _build_scan_summary(details)
 
     # Extract source revision
@@ -345,6 +388,7 @@ def process_directory(artifact_dir: Path) -> bool:
         source_meta.unlink()
 
     details = result.get("details", {})
+    _stage_gguf_guard_manifest(details)
     scan_summary = _build_scan_summary(details)
     scan_summary["model_type"] = "diffusion"
 
