@@ -1,281 +1,272 @@
 # ai-quarantine
 
-Seven-stage AI artifact admission-control pipeline. Verifies, scans, and
-smoke-tests model files before promoting them to a trusted registry.
+AI model artifact admission control for GGUF, safetensors, and bounded
+Diffusers-style directories. The watcher scans an artifact in quarantine,
+durably stages the artifact and its evidence, verifies the staged bundle, and
+then performs an authenticated idempotent registry commit. Registry consumers
+must treat only committed API/database records as trusted; filesystem presence
+alone is never an admission verdict.
 
-## What it does
+## Security properties
 
-Every model artifact (GGUF, safetensors, or diffusion directory) passes
-through a deterministic pipeline before it can be used:
+The core pipeline performs seven ordered gates:
 
-| Stage | Gate | Purpose |
-|-------|------|---------|
-| 1 | Source policy | Verify origin URL against an allowlist |
-| 2 | Format gate | Validate headers, reject unsafe formats (pickle, pt, bin) |
-| 3 | Integrity | SHA-256 hash pinning (TOFU for local, strict for remote) |
-| 4 | Provenance | Cosign signature verification where available |
-| 5 | Static scan | modelscan + fickling + entropy + weight distribution + gguf-guard |
-| 6 | Behavioral | Adversarial prompt suite (41 prompts, 50+ danger patterns) in CPU-only sandbox |
-| 7 | Diffusion deep | Config integrity, component validation, symlink detection |
+1. Canonical HTTPS source allowlisting.
+2. Strict format validation.
+3. SHA-256 pin enforcement.
+4. Available provenance checks.
+5. Static scanners and deterministic heuristics.
+6. Optional behavioral probing in an externally isolated worker.
+7. Diffusion configuration and tree validation.
 
-All stages run automatically. If any stage fails, the artifact is rejected.
+The parser rejects symlinks, hard links, special files, duplicate JSON keys,
+malformed GGUF metadata, ambiguous URL prefixes, safetensors buffer holes and
+overlaps, and unsafe or overlarge directory trees. GGUF template and weight
+analysis share the same bounded metadata parser. Descriptor-relative diffusion
+validation requires allowlisted `[library, class]` tuples, strict JSON, a
+configuration per component, and safetensors for weight-bearing components.
+Directory digests bind file content, paths, sizes, and empty-directory markers.
+Files and directories are hashed again around the registry move. A destination
+collision is rejected. A durable staging marker exists before the move;
+provenance and other evidence are written, hashed, and fsynced before a pending
+record permits any registry call. A crash during incomplete staging rolls the
+bundle back to quarantine. Once fully pending, API failure leaves a verified
+uncommitted bundle for bounded-batch, backoff-controlled replay using a stable
+idempotency key.
 
-## Deployment profiles
+This is admission control, not proof that a model is safe. Static and
+behavioral scanners can produce false positives and false negatives, and
+native parsers must still run in a strongly isolated process.
 
-Choose the profile that matches your environment. Profiles are complete policy
-files you can copy directly to `/etc/secure-ai/policy/policy.yaml`.
+## Profiles
 
-### Appliance profile (recommended for production)
+- [appliance-profile.yaml](examples/appliance-profile.yaml) is the production
+  baseline. It disables local imports, requires hash pins and behavioral
+  testing, and fails closed if a scanner is unavailable.
+- [standalone-profile.yaml](examples/standalone-profile.yaml) is for tests and
+  development. It permits local TOFU and optional-scanner skips.
 
-Use [`examples/appliance-profile.yaml`](examples/appliance-profile.yaml) when
-deploying as part of an immutable-OS appliance (e.g. SecAI_OS) or any
-production environment:
+Only documented keys in those profiles are currently evaluated. The pipeline
+always runs every applicable gate; there are no per-stage bypass toggles.
 
-- All seven stages enabled
-- `require_scan: true` and `require_behavior_tests: true`
-- `gguf_guard.required: true`
-- `scanner_missing: fail-closed` — missing scanners cause hard rejection
-- Registry URL restricted to localhost only
-- Offline by default — no outbound network access
-- No retained raw artifacts after scan
+## Development
 
-### Standalone profile (development and CI)
+Use Python 3.12 or newer in a project-local environment:
 
-Use [`examples/standalone-profile.yaml`](examples/standalone-profile.yaml) for
-developer workstations, CI pipelines, or environments without llama-server:
-
-- All seven stages enabled
-- `require_scan: true`, `require_behavior_tests: false` (no llama-server assumed)
-- `gguf_guard.required: false`
-- `scanner_missing: warn-and-skip` for optional scanners
-
-## Artifact states
-
+```bash
+python3.12 -m venv .venv
+.venv/bin/python -m pip install --require-hashes -r requirements-dev.lock
+.venv/bin/python -m pip install --no-deps --no-build-isolation -e .
+.venv/bin/python -m pytest -q
+.venv/bin/python -m ruff check .
+.venv/bin/python -m pip_audit -r requirements.lock --disable-pip
+.venv/bin/python -m pip_audit -r requirements-dev.lock --disable-pip
+.venv/bin/python -m bandit -q -r quarantine -ll
 ```
-PENDING -> SCANNING -> PASSED  (promoted to registry)
-                    -> FAILED  (stage failure, rejected)
-REJECTED                       (immediate format/policy violation)
-```
 
-## Quick start
+`requirements.lock` and `requirements-dev.lock` are generated with hashes.
+Regenerate and review both whenever dependency constraints change.
 
-### As a library
+### Library use
 
 ```python
-from quarantine.pipeline import run_pipeline
 from pathlib import Path
 
-# Secure default: all scanners required, fail-closed
-result = run_pipeline(
-    artifact_path=Path("model.gguf"),
-    file_hash="sha256...",
-    policy={"models": {"require_scan": True}},
-)
-print(result["passed"])  # True/False
-print(result["details"]) # per-stage evidence
-```
+from quarantine.pipeline import run_pipeline
 
-For development or testing where scanners are not installed, use a minimal
-policy that skips scanner requirements:
-
-```python
-# Development only — NOT for production use
 result = run_pipeline(
-    artifact_path=Path("model.gguf"),
-    file_hash="sha256...",
+    Path("model.gguf"),
+    file_hash="expected-sha256",
     policy={
-        "models": {"require_scan": True, "require_behavior_tests": False},
+        "models": {
+            "require_scan": False,
+            "require_behavior_tests": False,
+            "allow_local_imports": True,
+        },
         "quarantine": {"scanner_missing": "warn-and-skip"},
     },
 )
+print(result["passed"], result["details"])
 ```
 
-### As a watcher (filesystem monitor)
+The permissive settings above are for development only.
+
+## Production prerequisites
+
+Before starting the watcher:
+
+- Mount a non-world-writable policy file at `POLICY_PATH`.
+- Mount a registry bearer token as an owner-only regular single-link file and
+  set `SERVICE_TOKEN_PATH`. It must be owned by root or the service UID and
+  contain 32–4096 printable ASCII bytes with no whitespace or control bytes.
+- Use distinct, non-overlapping quarantine and registry directories.
+- Install every required scanner at a reviewed, pinned version.
+- Put scanner binaries on a controlled `PATH`, or configure their absolute
+  paths where supported.
+- Provision an audit HMAC key with the same owner, link, permission, length,
+  and printable-byte requirements and set `AUDIT_HMAC_KEY_PATH`.
+- Run the service with a private temporary directory, read-only system paths,
+  resource limits, and outbound-network restrictions.
+- Put behavioral inference in a separate sandboxed worker. Set
+  `SECAI_BEHAVIOR_SANDBOXED=1` only after that isolation is actually
+  enforced.
+
+The core container intentionally does not perform mutable, best-effort scanner
+installation. A production image should derive from it and add hash-locked,
+reviewed scanner binaries. With the appliance profile, missing scanners cause
+rejection.
+
+### Watcher configuration
 
 ```bash
 export QUARANTINE_DIR=/data/quarantine
 export REGISTRY_DIR=/data/registry
-export REGISTRY_URL=http://127.0.0.1:8470
-export SERVICE_TOKEN_PATH=/run/secure-ai/service-token
+export REGISTRY_URL=https://registry.internal.example
+export POLICY_PATH=/etc/secure-ai/policy/policy.yaml
+export MODELS_LOCK_PATH=/etc/secure-ai/policy/models.lock.yaml
+export SOURCES_ALLOWLIST_PATH=/etc/secure-ai/policy/sources.allowlist.yaml
+export SERVICE_TOKEN_PATH=/run/secrets/registry-token
+export AUDIT_HMAC_KEY_PATH=/run/secrets/audit-hmac-key
+export AUDIT_LOG_PATH=/var/lib/secure-ai/logs/quarantine-audit.jsonl
 ai-quarantine
 ```
 
+`REGISTRY_URL` must be an HTTP(S) origin with no credentials, path, query, or
+fragment. Plain HTTP is accepted only for a loopback address. Authentication
+is mandatory by default. For an explicitly disposable loopback-only
+development setup, `SECAI_ALLOW_INSECURE_REGISTRY=1` permits unauthenticated
+promotion; do not use it in production.
+
+Prefer file-backed credentials. `SERVICE_TOKEN` is supported for constrained
+environments but exposes the token to the process environment. Environment
+tokens are subject to the same 32–4096 printable non-whitespace byte rule.
+
+The watcher processes at most 128 queue objects per pass and inspects at most
+eight times that number without materializing or sorting the whole directory.
+A fixed 256-slot nonblocking `flock` set prevents concurrent double processing
+without attacker-controlled lock-file growth. Transient failures persist an
+exponential-backoff state; after three attempts the artifact and its source
+metadata move to a private terminal hold with a bounded rejection record.
+Hidden or special queue entries are also removed from the active namespace.
+Each pass replays at most 32 durable pending registry commits.
+
 ### Container
 
-```bash
-docker build -f Containerfile -t ai-quarantine .
-docker run --network=host \
-           -v /data/quarantine:/quarantine \
-           -v /data/registry:/registry \
-           -e REGISTRY_URL=http://127.0.0.1:8470 \
-           -e SERVICE_TOKEN_PATH=/run/secrets/registry-token \
-           -v /path/to/token:/run/secrets/registry-token:ro \
-           ai-quarantine
-```
-
-> **Note:** The quarantine watcher communicates with the registry over HTTP. Use `127.0.0.1` (localhost) to ensure traffic stays on the loopback interface. Never expose the registry on a remote address without TLS.
-
-## Configuration
-
-The pipeline reads policy from YAML files:
-
-- **policy.yaml** — stage toggles, thresholds, scanner requirements
-- **sources.allowlist.yaml** — trusted model sources (URL prefixes)
-- **models.lock.yaml** — pinned SHA-256 hashes for known-good artifacts
-
-See [examples/](examples/) for reference configurations, including the
-[appliance](examples/appliance-profile.yaml) and
-[standalone](examples/standalone-profile.yaml) deployment profiles.
-
-### Environment variables
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `QUARANTINE_DIR` | `/quarantine` | Drop directory for incoming artifacts |
-| `REGISTRY_DIR` | `/registry` | Destination for promoted artifacts |
-| `REGISTRY_URL` | `http://127.0.0.1:8470` | Registry API endpoint |
-| `POLICY_PATH` | `/etc/secure-ai/policy/policy.yaml` | Policy config path |
-| `MODELS_LOCK_PATH` | `/etc/secure-ai/policy/models.lock.yaml` | Hash pins |
-| `SOURCES_ALLOWLIST_PATH` | `/etc/secure-ai/policy/sources.allowlist.yaml` | Source allowlist |
-| `LLAMA_SERVER_BIN` | `/usr/bin/llama-server` | Path to llama-server for smoke tests |
-| `GGUF_GUARD_BIN` | `/usr/local/bin/gguf-guard` | Path to gguf-guard scanner |
-| `SMOKE_TEST_TIMEOUT` | `120` | Seconds to wait for llama-server startup |
-| `AUDIT_LOG_PATH` | `/var/lib/secure-ai/logs/quarantine-audit.jsonl` | Hash-chained audit log |
-| `SERVICE_TOKEN` | *(empty)* | Bearer token for authenticated registry promotion |
-| `SERVICE_TOKEN_PATH` | *(empty)* | Path to file containing the service token |
-
-## Registry integration
-
-The watcher promotes passing artifacts to the registry via its HTTP API
-(`POST /v1/model/promote`).
-
-### Authenticated promotion
-
-When `SERVICE_TOKEN` is set (or `SERVICE_TOKEN_PATH` points to a token file),
-the watcher includes an `Authorization: Bearer <token>` header in all
-promotion requests. This prevents unauthorized artifact promotion when the
-registry enforces authentication.
+Build the deterministic core image:
 
 ```bash
-# Option 1: token in environment variable
-export SERVICE_TOKEN="your-registry-token"
-
-# Option 2: token in a file (useful with Kubernetes secrets or systemd credentials)
-export SERVICE_TOKEN_PATH="/run/secrets/registry-token"
+docker build --pull=false -f Containerfile -t ai-quarantine .
 ```
 
-The token is read once per promotion request. If both `SERVICE_TOKEN` and
-`SERVICE_TOKEN_PATH` are set, the environment variable takes precedence.
+Run it in the same tightly controlled pod/network namespace as a loopback
+registry, or use an authenticated HTTPS registry. Mount policy, lock, allowlist,
+token, and audit key files read-only; mount quarantine, registry, and audit
+storage separately. Do not use host networking merely for convenience.
+
+Recommended runtime controls include a read-only root filesystem,
+`no-new-privileges`, dropped Linux capabilities, a restrictive seccomp
+profile, memory/CPU/PID limits, and an explicit egress policy. The container
+uses a reviewed digest-pinned base without mutable OS-package resolution during
+the build and is gated against fixable high/critical image vulnerabilities.
+Application directories/files are root-owned mode 0555/0444, while only the
+explicit data mounts are writable. It runs as numeric UID/GID 65532 and
+contains only the core Python dependency.
+
+## Policy keys
+
+| Key | Meaning |
+|---|---|
+| `models.allowed_formats` | Subset of `gguf` and `safetensors` |
+| `models.require_scan` | Require ModelScan |
+| `models.require_behavior_tests` | Require llama-server behavioral checks |
+| `models.allow_local_imports` | Permit artifacts without source metadata |
+| `models.require_hash_pin_for_local` | Reject unpinned local artifacts |
+| `models.allow_diffusion_directories` | Permit directory artifacts |
+| `quarantine.scanner_missing` | `fail-closed` or `warn-and-skip` |
+| `quarantine.smoke_test_max_score` | Maximum behavioral flag ratio |
+| `quarantine.smoke_test_max_critical` | Maximum critical-category flags |
+| `gguf_guard.required` | Require gguf-guard for GGUF artifacts |
+
+Remote artifacts always require both a canonical allowlisted HTTPS source and a
+matching entry in `models.lock.yaml`. Source URLs containing credentials,
+queries, fragments, nonstandard ports, traversal, or control characters are
+rejected.
 
 ## External scanners
 
-The pipeline integrates with optional external tools. In the default secure
-policy (`scanner_missing: fail-closed`), a missing scanner causes the artifact
-to be rejected. Use the standalone profile for environments where not all
-scanners are installed.
+The integration supports ModelScan, Fickling, ModelAudit, gguf-guard, Garak,
+llama-server, cosign, and fs-verity. Scanner processes handle hostile data and
+must be treated as an untrusted parsing tier. The production profile fails
+closed on missing static and behavioral scanners.
 
-| Scanner | Stage | Purpose |
-|---------|-------|---------|
-| [modelscan](https://github.com/protectai/modelscan) | 5 | Detect malicious serialization |
-| [fickling](https://github.com/trailofbits/fickling) | 5 | Pickle safety analysis |
-| [modelaudit](https://pypi.org/project/modelaudit/) | 5 | Second-opinion static scan |
-| [gguf-guard](https://github.com/SecAI-Hub/gguf-guard) | 5 | GGUF weight-level anomaly detection |
-| [garak](https://github.com/NVIDIA/garak) | 6 | LLM vulnerability probing |
-| [llama-server](https://github.com/ggml-org/llama.cpp) | 6 | CPU-only inference for smoke tests |
-| [cosign](https://github.com/sigstore/cosign) | 4 | Signature verification |
-| [fsverity](https://www.kernel.org/doc/html/latest/filesystems/fsverity.html) | post | Kernel-level file integrity |
+External results are not accepted merely because a process exits zero.
+ModelScan must report a version, zero errors/skips, positive coverage of the
+requested artifact, and an explicit empty issue set. Fickling must provide an
+explicit boolean safety verdict, and ModelAudit must provide a versioned issue
+list. Garak must produce one bounded JSONL report with at least one evaluated
+probe. Missing, contradictory, malformed, empty, or partial reports fail.
 
-## Sandbox isolation
+Every configured behavioral prompt must return one bounded, non-empty,
+schema-valid response. Timeouts, transport errors, malformed JSON, oversized
+bodies, and empty content are distinct failures. llama-server output is sent
+to a bounded sink rather than retained in undrained pipes or audit evidence.
 
-Stage 6 (behavioral smoke test) runs adversarial prompts against the model
-inside a constrained sandbox. The sandbox provides the following isolation
-guarantees:
+The behavioral score is a regression signal, not a general safety benchmark.
+The current library starts llama-server locally; network and filesystem
+isolation are deployment responsibilities. SecAI_OS should use its dedicated
+scanner worker/sandbox rather than invoking native model parsers in a broadly
+privileged watcher process.
 
-- **CPU-only inference**: llama-server is invoked with `--n-gpu-layers 0`,
-  ensuring no GPU driver interaction and reducing the attack surface.
-- **Localhost-only binding**: The server binds to `127.0.0.1` only. It is
-  not reachable from any external network interface.
-- **No network access from the model**: The model runs inside llama-server
-  which has no outbound networking capability. The model cannot fetch remote
-  resources or exfiltrate data.
-- **Ephemeral**: The server is started, tested against the adversarial prompt
-  suite, and immediately terminated. No persistent state is retained.
-- **Resource limits (systemd deployment)**: When deployed via systemd, the
-  service unit enforces hard limits:
-  - `MemoryMax=4G` — 4 GB memory ceiling
-  - `TasksMax=128` — maximum 128 concurrent tasks
-  - `SystemCallFilter=@system-service` — seccomp syscall allowlist
-- **No ambient secrets**: The systemd unit uses `PrivateTmp=yes`,
-  `ProtectHome=yes`, and `ReadOnlyPaths=/` to prevent the sandbox from
-  accessing user data, temporary files, or modifying the filesystem.
+## Audit and provenance
 
-## Signed verdicts
+Audit entries are JSONL records chained with SHA-256 or, when configured,
+HMAC-SHA-256. The watcher refuses to append to a corrupt existing chain,
+securely appends and fsyncs mode-0600 records, and verifies rotated archives.
 
-Each promoted artifact receives a JSON provenance manifest
-(`<filename>.provenance.json`) stored alongside the artifact in the registry
-directory. The manifest records:
+A plain SHA-256 chain detects modification within retained logs but cannot
+prove that an attacker did not delete the entire tail. Configure
+`AUDIT_HMAC_KEY_PATH` to enable an authenticated checkpoint that detects tail,
+archive, and complete-log deletion while that checkpoint survives. If an
+attacker deletes both all co-located logs and the checkpoint, the local node no
+longer has evidence with which to prove the deletion. Keep the key outside the
+log storage and replicate checkpoints/archives to append-only or remote
+storage. The implementation is single-process; do not run multiple watcher
+writers against one log.
 
-- Artifact SHA-256 hash and size
-- Source URL and revision
-- Scanner versions used during scanning
-- Policy version (hash of policy file at scan time)
-- Promotion timestamp and hostname
-- Scan summary (pass/fail per stage)
-- fs-verity digest (if enabled)
+Before a registry call, the watcher creates and fsyncs provenance JSON and any
+configured detached signature/guard evidence, records their hashes and sizes
+in a durable pending journal, re-verifies the artifact/evidence/payload
+binding, and sends the journal-derived promotion ID as the API idempotency key.
+The registry commit is the last admission step. If
+`/etc/secure-ai/keys/cosign.key` is present, signing is mandatory for that
+bundle; unsigned local provenance remains metadata, not non-repudiation.
 
-If a cosign signing key is available at `/etc/secure-ai/keys/cosign.key`, the
-manifest is automatically signed. Verify the signature:
+## Known limits
 
-```bash
-cosign verify-blob --key cosign.pub --signature file.provenance.json.sig file.provenance.json
-```
+- Scanner and model-runtime zero-days remain possible.
+- The standalone process does not itself create a kernel-enforced sandbox.
+- Source allowlisting plus a hash pin proves identity, not publisher intent.
+- Local TOFU is intentionally available only for development profiles.
+- Recovery and rollback cannot succeed while the underlying filesystem is
+  unavailable; operators must alert on pending/invalid journals and terminal
+  holds.
+- Registry storage and its database are not one filesystem transaction. The
+  integration therefore requires registry consumers to ignore uncommitted
+  files and the API to honor idempotency keys; a server-owned staging/commit
+  API would reduce this residual coupling.
+- Hash-chain HMAC checkpoints do not replace remote/WORM log replication.
+- All ModelScan integrations must reject errors, skipped artifacts, and zero
+  coverage; a scanner that does not support the admitted format is not evidence
+  of a clean artifact.
+- Multi-process audit writers are unsupported.
 
-Unsigned manifests still provide a tamper-evident record when combined with
-the hash-chained audit log. Signing adds non-repudiation.
+See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for the audit record, completed
+remediations, residual risks, and production roadmap.
 
-## Audit logging
+## Security reports
 
-All scan decisions are recorded in a hash-chained JSONL audit log. Each entry
-contains a SHA-256 link to the previous entry, forming a tamper-evident chain.
-Verify chain integrity:
-
-```python
-from quarantine.audit_chain import AuditChain
-result = AuditChain.verify("/path/to/quarantine-audit.jsonl")
-print(result)  # {"valid": True, "entries": 42, ...}
-```
-
-## Privacy: metadata and retention
-
-### What is stored in the audit log
-
-Each audit entry records: event type, filename, SHA-256 hash, timestamp,
-scan pass/fail result, and scanner versions. Entries are hash-chained
-(each entry includes the SHA-256 of the previous entry) for tamper evidence.
-
-### What is NOT stored
-
-The audit log does not contain: raw model weights, user identity, IP
-addresses, or any personally identifiable information.
-
-### Artifact retention
-
-- **Rejected artifacts** are deleted immediately after the pipeline verdict.
-  No copy of a rejected artifact is retained on disk.
-- **Promoted artifacts** are the only artifacts retained, stored in the
-  registry directory alongside their provenance manifests.
-
-### Provenance manifests
-
-Each promoted artifact gets a provenance manifest containing a scan summary
-(pass/fail per stage, scanner versions, policy hash). The manifest does not
-include raw scan output or detailed scanner logs.
-
-### Log rotation
-
-The audit log rotates at 50 MB by default (configurable via the `max_size_mb`
-parameter). Archived logs are set to read-only mode (0444 permissions) to
-prevent accidental modification.
+Do not open public issues for suspected bypasses. Follow
+[SECURITY.md](SECURITY.md).
 
 ## License
 

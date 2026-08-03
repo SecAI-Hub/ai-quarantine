@@ -1,44 +1,20 @@
-# Appliance deployment profile — for use with SecAI_OS or similar
-# immutable-OS, air-gapped, local-only AI appliances.
-#
-# All stages enabled, fail-closed for missing scanners, no retained
-# raw artifacts after scan. Designed for maximum security posture.
-
+# Production profile. The watcher still requires authenticated registry access,
+# hash-locked scanner installation, an HMAC audit key, and external behavioral
+# worker isolation as documented in README.md.
 version: 1
 
 models:
   allowed_formats: ["gguf", "safetensors"]
-  deny_formats: ["pickle", "pt", "bin"]
   require_scan: true
   require_behavior_tests: true
-  require_source_verification: true
-  require_entropy_analysis: true
+  allow_local_imports: false
+  require_hash_pin_for_local: true
   allow_diffusion_directories: true
 
 quarantine:
-  stages:
-    source_policy: true
-    format_gate: true
-    integrity_check: true
-    provenance_check: true
-    static_scan: true
-    behavioral_test: true
-    diffusion_deep_scan: true
+  scanner_missing: fail-closed
   smoke_test_max_score: 0.3
   smoke_test_max_critical: 1
-  scanner_missing: fail-closed
-  retain_raw_artifacts: false
 
 gguf_guard:
   required: true
-  generate_manifest: true
-  generate_fingerprint: true
-  verify_on_integrity_check: true
-
-registry:
-  url: "http://127.0.0.1:8470"
-  localhost_only: true
-
-network:
-  offline_by_default: true
-  allow_outbound: false

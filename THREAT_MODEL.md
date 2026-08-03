@@ -1,112 +1,78 @@
-# Threat Model
+# Threat model
 
-This document describes the trust boundaries, threat actors, mitigations,
-and residual risks for the ai-quarantine pipeline.
+## Scope and assets
+
+ai-quarantine decides whether hostile model artifacts may enter a trusted local
+registry. Protected assets include registry integrity, registry credentials,
+host confidentiality/availability, audit evidence, scanner integrity, and the
+correct association between an artifact digest and its verdict.
+
+The project does not claim to establish that a model is free of backdoors or
+that its outputs are generally safe.
 
 ## Trust boundaries
 
-```
-  Untrusted                        Trusted
-  ┌──────────┐   ┌───────────────────────────────────────┐   ┌──────────┐
-  │ Artifact │──▶│  Quarantine Pipeline (7 stages)       │──▶│ Registry │
-  │ Source   │   │  ┌────────┐ ┌──────────┐ ┌─────────┐ │   │ (local)  │
-  └──────────┘   │  │External│ │llama-srvr│ │ Audit   │ │   └──────────┘
-                 │  │Scanners│ │ Sandbox  │ │ Chain   │ │
-                 │  └────────┘ └──────────┘ └─────────┘ │
-                 └───────────────────────────────────────┘
-```
+- Artifact bytes, names, directory trees, source sidecars, model metadata,
+  tokenizer/configuration files, and model-generated output are untrusted.
+- Policy, hash locks, source allowlists, scanner binaries/images, registry
+  service, audit HMAC key, and signing keys are administrative trust inputs.
+- Third-party scanners and model runtimes are trusted for their verdict
+  contract but treated as hostile-input parsers that may be exploitable.
+- The quarantine drop location is untrusted. The registry storage and registry
+  database are trusted and must not be writable by artifact submitters.
+- The watcher is a single trusted coordinator, not a sandbox boundary.
 
-| Boundary | Description |
-|----------|-------------|
-| **Artifact source** | Untrusted. Models arrive from the internet, local imports, or peer transfers. Source URL is verified against an allowlist but the artifact content is untrusted until all stages pass. |
-| **Quarantine pipeline** | Trusted execution environment. Runs as a system service with controlled privileges. All scan decisions are recorded in the hash-chained audit log. |
-| **External scanners** | Semi-trusted. modelscan, fickling, garak, and gguf-guard are invoked as subprocesses. They process untrusted input and may themselves be compromised. |
-| **llama-server sandbox** | Constrained trust. CPU-only, localhost-bound, no outbound network, ephemeral process. Resource-limited via systemd when deployed (4 GB memory, 128 tasks, seccomp). |
-| **Registry** | Trusted store. Only artifacts that pass all seven stages are promoted. Protected by fs-verity and signed provenance manifests. |
+## Threats and controls
 
-## Threats
+| Threat | Primary controls |
+|---|---|
+| Source allowlist confusion/SSRF metadata | Canonical HTTPS origin/path matching; credentials, query, fragment, traversal, unsafe encoding, controls, and nonstandard ports rejected. |
+| Format confusion or parser bombs | Strict safetensors layout checks; one bounded fail-closed GGUF metadata parser for templates/weights; descriptor-relative bounded directory traversal; strict JSON; only GGUF/safetensors accepted. |
+| Malicious diffusion component loading | Exact allowlisted `[library, class]` tuples, allowlisted pipeline classes, required component configuration, required safetensors for weight-bearing components, and directory-marker-bound hashes. |
+| Symlink, hard-link, FIFO/device, or replacement race | Descriptor-relative/no-follow single-link regular-file opens, special-file rejection, bounded link-free traversal, metadata revalidation, and pre/post-move hashes. |
+| Unpinned remote artifact | Remote artifacts require both an allowlisted source and exact SHA-256 pin. |
+| Untrusted local TOFU | Production policy disables local imports and requires pins; development may opt in. |
+| Scanner missing/crash/timeout/partial report | Versioned explicit scanner verdicts; ModelScan requires zero errors/skips and positive expected coverage; every behavioral prompt and a nonzero bounded Garak report are required; production scanner mode fails closed. |
+| Scanner/runtime escape | Deployment must use a separate disposable worker with no egress, minimal read-only mounts, seccomp/namespaces or microVM isolation, and no secrets. |
+| Unauthorized registry promotion | Mandatory bearer token by default; secure credential files; non-loopback plaintext HTTP rejected. |
+| Partial promotion or trusted-name overwrite | Existing names are never overwritten; a durable pre-move marker enables rollback of incomplete staging; artifact, provenance, signatures, guard evidence, payload, and journal are hashed/fsynced/reverified before an idempotent API commit; fully staged failures replay from the pending journal. |
+| Queue flooding, double processing, or permanent retry loops | Bounded streaming `scandir`, fixed-slot nonblocking claims, persistent exponential backoff, a three-attempt ceiling, private terminal hold, and bounded pending-commit replay. |
+| Audit alteration/deletion | Verified append-only chain, restrictive no-follow I/O, fsync, rotation, optional HMAC entries and authenticated tail checkpoint, remote/WORM replication required to detect deletion of all co-located evidence. |
+| Provenance overwrite/partial write | Atomic no-replace manifest creation and optional detached cosign signature. |
+| CI/dependency compromise | Reviewed digest-pinned base image with no mutable OS-package build step, hash-locked Python dependencies, full-SHA actions, pip-audit/Bandit/Ruff/test/Trivy gates, root-owned read-only source, SBOM/provenance, and keyless image signing in release workflow. |
+| Secret leakage or weak secret material | Credentials are not logged; token/HMAC files are no-follow single-link regular files owned by root/current UID with no group/other bits; values require 32–4096 printable non-whitespace bytes; source logs contain only a hostname. |
 
-### T1 — Malicious model bypass
+## Required deployment assumptions
 
-**Attacker goal:** Get a trojaned or backdoored model promoted to the trusted
-registry.
+- Quarantine and registry paths are distinct and non-overlapping.
+- Artifact submitters cannot write registry storage, policy, locks, allowlists,
+  scanner binaries, audit keys, or service credentials.
+- One watcher process writes each audit chain.
+- A fail-closed production profile is mounted and validated at startup.
+- Required scanners are installed from a reviewed, immutable build.
+- Behavioral tests run only in a genuinely isolated worker; setting
+  `SECAI_BEHAVIOR_SANDBOXED=1` does not create isolation.
+- Registry and audit storage failures are monitored and fail the workflow.
+- Registry consumers use only committed API/database records and never infer
+  trust from a filename present in registry storage. The registry honors the
+  watcher-provided idempotency key.
+- Signed checkpoints/archives are replicated outside the host.
 
-**Attack vectors:**
-- Craft a model that passes static scans but contains hidden behaviors
-- Embed malicious payloads in non-weight metadata (chat templates, tokenizer configs)
-- Use subtle weight modifications that evade statistical anomaly detection
+## Residual risk
 
-### T2 — Scanner evasion
+- Novel scanner evasions, poisoned but correctly signed upstream models, and
+  subtle weight-level backdoors remain possible.
+- Native parser and model-runtime zero-days remain a high-impact risk.
+- The durable watcher-side staging journal makes crashes recoverable, but the
+  filesystem bundle and registry database are still not a server-owned atomic
+  transaction; correctness depends on the committed-record and idempotency
+  contract above.
+- fs-verity, mTLS/workload identity, remote transparency anchoring, and
+  mandatory signed verdict policy require additional integration.
+- A compromised host or trusted administrator can defeat local controls.
+- The local HMAC checkpoint does not replace independent remote retention.
+- If both all logs and their co-located checkpoint are removed, the local node
+  cannot prove that deletion occurred.
 
-**Attacker goal:** Craft artifacts that exploit blind spots in the scanning
-tools.
-
-**Attack vectors:**
-- Polyglot files (valid GGUF header but embedded pickle/executable payload)
-- Format confusion (e.g. .safetensors extension with pickle content)
-- Adversarial inputs that crash or confuse scanners
-- Entropy manipulation to avoid anomaly triggers
-
-### T3 — Sandbox escape
-
-**Attacker goal:** Break out of the behavioral smoke test sandbox to access
-the host system.
-
-**Attack vectors:**
-- Exploit llama-server vulnerabilities during inference
-- Generate outputs that trigger shell injection in post-processing
-- Attempt network access from the sandboxed process
-
-### T4 — Promotion without scan
-
-**Attacker goal:** Get an artifact into the registry without completing all
-pipeline stages.
-
-**Attack vectors:**
-- Race condition: drop artifact directly into registry directory
-- Bypass watcher by manipulating file metadata or symlinks
-- Exploit pipeline logic errors to skip stages
-
-### T5 — Audit log tampering
-
-**Attacker goal:** Modify or delete audit entries to hide evidence of a
-rejected or suspicious artifact.
-
-**Attack vectors:**
-- Direct file modification (truncation, entry deletion)
-- Insert forged entries to obscure timeline
-- Corrupt the hash chain to invalidate the log
-
-### T6 — Scanner supply chain compromise
-
-**Attacker goal:** Compromise an external scanner (modelscan, fickling, garak,
-gguf-guard) to produce false negatives.
-
-**Attack vectors:**
-- Publish a malicious update to a scanner package
-- Dependency confusion attack on scanner dependencies
-- Compromise the scanner's release signing key
-
-## Mitigations
-
-| Threat | Mitigation |
-|--------|------------|
-| T1 — Malicious bypass | Seven-stage pipeline with defense in depth: format validation, polyglot detection, entropy analysis, weight anomaly detection, adversarial prompt suite (41 prompts, 50+ danger patterns), and Jinja template scanning. |
-| T2 — Scanner evasion | Multiple independent scanners (modelscan, fickling, gguf-guard, modelaudit) reduce single-point-of-failure risk. Fail-closed defaults reject artifacts when scanners are unavailable. Format allowlist blocks unsafe serialization formats (pickle, pt, bin). |
-| T3 — Sandbox escape | CPU-only inference (--n-gpu-layers 0), localhost-only binding (127.0.0.1), no outbound network from model process, ephemeral server lifecycle, systemd resource limits (MemoryMax=4G, TasksMax=128, seccomp, PrivateTmp, ProtectHome). |
-| T4 — Promotion without scan | Pipeline enforces sequential stage completion. Watcher owns the quarantine-to-registry file move. Registry directory is not writable by unprivileged users. Provenance manifest records which stages ran. |
-| T5 — Audit log tampering | Hash-chained JSONL log: each entry includes SHA-256 of previous entry. Chain verification detects any modification, deletion, or insertion. Rotated logs are set read-only (0444). |
-| T6 — Scanner supply chain | Pin scanner versions in requirements.lock with hash verification (--require-hashes). Record scanner versions in provenance manifests. Container image uses pinned base image digest. |
-
-## Residual risks
-
-These risks are acknowledged but not fully mitigated by the current pipeline:
-
-| Risk | Description | Severity |
-|------|-------------|----------|
-| **Novel evasion techniques** | New attack methods may bypass current scanners before detection signatures are updated. | High |
-| **Scanner false negatives** | No scanner is perfect. A model may contain subtle backdoors that pass all current checks. | High |
-| **Sophisticated weight-level attacks** | Weight anomaly detection uses statistical heuristics (kurtosis, zero fraction, entropy). Carefully crafted attacks that stay within normal statistical bounds may evade detection. | Medium |
-| **Zero-day in llama-server** | A vulnerability in llama-server could allow sandbox escape during behavioral testing. Mitigated by CPU-only mode and systemd hardening but not eliminated. | Medium |
-| **Compromised host** | If the host OS is compromised, all pipeline guarantees are void. The immutable-OS deployment (uBlue/Silverblue) mitigates but does not eliminate this. | High |
-| **Time-of-check/time-of-use** | A model file could theoretically be modified between scan completion and promotion. Mitigated by atomic file move and fs-verity. | Low |
+See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for priorities and the SecAI_OS
+integration roadmap.

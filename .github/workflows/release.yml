@@ -5,31 +5,118 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
-  packages: write
-  id-token: write
-  attestations: write
+permissions: {}
 
 jobs:
-  test:
-    name: Test
+  release-gate:
+    name: Verify release provenance
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require an annotated SemVer tag on main
+        run: |
+          python - <<'PY'
+          import os
+          import pathlib
+          import re
+          import sys
+          import tomllib
+
+          tag = os.environ["GITHUB_REF_NAME"]
+          semver = re.compile(
+              r"^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+              r"(?:-(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+              r"(?:\.(?:0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?"
+              r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+          )
+          if semver.fullmatch(tag) is None:
+              print(f"release tag is not strict SemVer: {tag!r}", file=sys.stderr)
+              sys.exit(1)
+          project_version = tomllib.loads(pathlib.Path("pyproject.toml").read_text())["project"]["version"]
+          init_text = pathlib.Path("quarantine/__init__.py").read_text()
+          package_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_text, re.MULTILINE)
+          if tag != f"v{project_version}" or package_match is None or package_match.group(1) != project_version:
+              print("release tag, project version, and package version must match", file=sys.stderr)
+              sys.exit(1)
+          PY
+          test "$(git cat-file -t "$GITHUB_REF")" = tag
+          test "$(git cat-file -p "$GITHUB_REF" | sed -n '2s/^type //p')" = commit
+          test "$(git rev-parse "$GITHUB_REF^{}")" = "$(git rev-parse HEAD)"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor HEAD origin/main
+
+  test:
+    name: Test release candidate
+    needs: release-gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan repository for secrets
+        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-      - name: Install dependencies
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install hash-locked dependencies
         run: |
-          pip install -e ".[dev]"
-      - name: Run tests
-        run: python -m pytest tests/ -v
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+          python -m pip check
+      - name: Run release gates
+        run: |
+          python - <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          invalid = []
+          for path in pathlib.Path(".github/workflows").glob("*.yml"):
+              for line_number, line in enumerate(path.read_text().splitlines(), 1):
+                  match = re.search(r"\buses:\s*([^\s]+)", line)
+                  if match and not re.search(r"@[0-9a-f]{40}$", match.group(1)):
+                      invalid.append(f"{path}:{line_number}: {match.group(1)}")
+          if invalid:
+              print("\n".join(invalid))
+              sys.exit(1)
+          PY
+          python -m ruff check .
+          python -m pytest -q
+          python -m pip_audit -r requirements.lock --disable-pip
+          python -m pip_audit -r requirements-dev.lock --disable-pip
+          python -m bandit -q -r quarantine -ll
+          python -m build
+          docker build --pull=false -f Containerfile -t ai-quarantine:release-gate .
+          docker run --rm --read-only --tmpfs /tmp:rw,noexec,nosuid,nodev \
+            --entrypoint sh ai-quarantine:release-gate -eu -c \
+            'test "$(stat -c %u:%g /opt/ai-quarantine/quarantine/watcher.py)" = 0:0; test "$(stat -c %a /opt/ai-quarantine/quarantine/watcher.py)" = 444; test ! -w /opt/ai-quarantine/quarantine/watcher.py'
+      - name: Scan release container for fixable high and critical vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ai-quarantine:release-gate
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: 1
 
   container:
-    name: Build & Push Container
+    name: Build, attest, and sign container
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     permissions:
       contents: read
       packages: write
@@ -38,30 +125,31 @@ jobs:
       REGISTRY: ghcr.io
       IMAGE_NAME: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Log in to GHCR
-        uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.4.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
+      - name: Derive collision-free immutable image tag
+        id: release-tag
+        shell: bash
+        run: echo "value=${GITHUB_REF_NAME//+/_}" >> "$GITHUB_OUTPUT"
       - name: Extract metadata
         id: meta
-        uses: docker/metadata-action@902fa8ec7d6ecbf8d84d538b9b233a880e428804 # v5.7.0
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ steps.release-tag.outputs.value }}
             type=sha
-
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
-
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
       - name: Build and push container image
-        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         id: push
         with:
           context: .
@@ -69,33 +157,43 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-
+          provenance: mode=max
+          sbom: true
       - name: Install cosign
-        uses: sigstore/cosign-installer@3454372be43a1bf12a3d0be3db81e77225c69aab # v3.8.2
-
-      - name: Sign container image with cosign (keyless)
-        run: |
-          cosign sign --yes ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Sign container image with cosign
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "${REGISTRY}/${IMAGE_NAME}@${DIGEST}"
 
   release:
-    name: Create Release
+    name: Build and attest Python artifacts
     needs: test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: write
       id-token: write
       attestations: write
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-
-      - name: Generate SLSA provenance attestation
-        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd # v2.3.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          subject-path: "quarantine/*.py"
-
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.lock
+      - name: Install build tooling
+        run: python -m pip install --require-hashes -r requirements-dev.lock
+      - name: Build distributions
+        run: python -m build
+      - name: Attest distributions
+        uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        with:
+          subject-path: "dist/*"
       - name: Create GitHub release
-        uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
+        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          files: dist/*

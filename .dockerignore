@@ -1,0 +1,12 @@
+.git
+.github
+.venv
+__pycache__
+*.py[cod]
+*.log
+*.key
+*.checkpoint
+.env*
+tests
+docs
+SECURITY_AUDIT.md

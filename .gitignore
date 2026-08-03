@@ -26,3 +26,18 @@ htmlcov/
 *.safetensors
 *.jsonl
 quarantine-audit.*
+
+# Local secrets and runtime state
+.env
+.env.*
+!.env.example
+*.token
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials/
+*.db
+*.sqlite
+*.sqlite3

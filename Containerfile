@@ -1,18 +1,29 @@
-FROM docker.io/library/python:3.12-slim@sha256:ccc7089399c8bb65dd1fb3ed6d55efa538a3f5e7fca3f5988ac3b5b87e593bf0
+FROM docker.io/library/python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
-WORKDIR /app
-COPY pyproject.toml .
-COPY requirements.lock .
-COPY quarantine/ quarantine/
+LABEL org.opencontainers.image.source="https://github.com/SecAI-Hub/ai-quarantine" \
+      org.opencontainers.image.description="AI artifact admission-control core"
 
-RUN pip install --no-cache-dir --require-hashes -r requirements.lock && \
-    pip install --no-cache-dir --no-deps .
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
-# Install scanning tools — each independently so one failure doesn't block others
-RUN pip install --no-cache-dir modelscan || echo "WARN: modelscan not available"
-RUN pip install --no-cache-dir fickling || echo "WARN: fickling not available"
-RUN pip install --no-cache-dir garak || echo "WARN: garak not available"
-RUN pip install --no-cache-dir modelaudit || echo "WARN: modelaudit not available"
+WORKDIR /opt/ai-quarantine
 
-USER 65534:65534
-ENTRYPOINT ["ai-quarantine"]
+COPY requirements.lock /opt/ai-quarantine/requirements.lock
+
+RUN python -m pip install --require-hashes -r requirements.lock && \
+    install -d -m 0700 -o 65532 -g 65532 /quarantine /var/lib/secure-ai/logs && \
+    install -d -m 0750 -o 65532 -g 65532 /registry
+
+COPY --chown=0:0 quarantine/ /opt/ai-quarantine/quarantine/
+
+# External scanners are intentionally not installed with mutable, best-effort
+# commands. Production images must add reviewed scanners at pinned versions and
+# keep scanner_missing=fail-closed.
+RUN python -m compileall -q /opt/ai-quarantine/quarantine && \
+    find /opt/ai-quarantine -type d -exec chmod 0555 {} + && \
+    find /opt/ai-quarantine -type f -exec chmod 0444 {} +
+
+USER 65532:65532
+ENTRYPOINT ["python", "-I", "-c", "import sys; sys.path.insert(0, '/opt/ai-quarantine'); from quarantine.watcher import main; main()"]

@@ -2,8 +2,8 @@ version: 1
 
 # Pinned model artifacts. Each entry records the verified SHA-256 hash.
 # Remote downloads are rejected unless they match a pin here.
-# Local imports use trust-on-first-use (TOFU) but must be pinned
-# before subsequent promotions.
+# Production policy disables local imports and requires pins. The development
+# profile permits trust-on-first-use (TOFU) for local artifacts.
 
 models: []
   # Example:

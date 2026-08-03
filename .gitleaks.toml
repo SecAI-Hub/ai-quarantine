@@ -1,0 +1,9 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Behavioral scanner canaries are inert detection strings"
+regexTarget = "match"
+regexes = [
+  '''CANARY_TOKEN_a8f3e2d1", "SECRET_MARKER_7b2c9f4e''',
+]

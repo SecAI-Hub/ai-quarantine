@@ -3,8 +3,12 @@
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
+import quarantine.pipeline as pipeline_module
 from quarantine.pipeline import (
     DANGER_PATTERNS,
     SMOKE_PROMPTS,
@@ -15,16 +19,19 @@ from quarantine.pipeline import (
     _check_pickle_polyglot,
     _check_weight_anomalies,
     _compute_tensor_stats,
+    _parse_garak_report,
+    _query_llama,
     _run_fickling_scan,
     _run_garak_scan,
-    _run_gguf_guard_scan,
-    _run_gguf_guard_manifest,
     _run_gguf_guard_fingerprint,
+    _run_gguf_guard_manifest,
+    _run_gguf_guard_scan,
     _run_modelaudit,
     _scan_gguf_chat_template,
     _stats_from_values,
     _validate_gguf_header,
     _validate_safetensors_header,
+    _validated_modelscan_result,
     check_diffusion_config_integrity,
     check_format_gate,
     check_format_gate_directory,
@@ -42,7 +49,6 @@ from quarantine.watcher import (
     _stage_gguf_guard_manifest,
     _write_provenance_manifest,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,7 +88,17 @@ def make_gguf_with_template(tmp_path: Path, template: str, name: str = "test.ggu
 def make_safetensors_file(tmp_path: Path, name: str = "test.safetensors") -> Path:
     """Create a minimal valid safetensors file."""
     p = tmp_path / name
-    header = b'{"__metadata__": {}}'
+    header = json.dumps(
+        {
+            "weight": {
+                "dtype": "U8",
+                "shape": [100],
+                "data_offsets": [0, 100],
+            },
+            "__metadata__": {},
+        },
+        separators=(",", ":"),
+    ).encode()
     with open(p, "wb") as f:
         f.write(struct.pack("<Q", len(header)))
         f.write(header)
@@ -143,6 +159,36 @@ class TestSourcePolicy:
             result = check_source_policy("https://huggingface.co/model.gguf")
         assert not result["passed"]
         assert "no source allowlist" in result["reason"]
+
+    def test_hostname_prefix_confusion_rejected(self):
+        with patch(
+            "quarantine.pipeline._load_source_allowlist",
+            return_value=["https://huggingface.co/models"],
+        ):
+            sibling = check_source_policy(
+                "https://huggingface.co.evil.example/models/model.gguf"
+            )
+            path_confusion = check_source_policy(
+                "https://huggingface.co/models-evil/model.gguf"
+            )
+        assert not sibling["passed"]
+        assert not path_confusion["passed"]
+
+    def test_credential_query_fragment_and_nonstandard_port_rejected(self):
+        invalid = [
+            "https://user@huggingface.co/models/model.gguf",
+            "https://huggingface.co/models/model.gguf?token=secret",
+            "https://huggingface.co/models/model.gguf#fragment",
+            "https://huggingface.co:8443/models/model.gguf",
+            "https://huggingface.co/models/../private/model.gguf",
+            "https://huggingface.co/models/%2e%2e/private/model.gguf",
+        ]
+        with patch(
+            "quarantine.pipeline._load_source_allowlist",
+            return_value=["https://huggingface.co/models"],
+        ):
+            results = [check_source_policy(url) for url in invalid]
+        assert all(not result["passed"] for result in results)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +319,32 @@ class TestSafetensorsHeader:
         assert not result["passed"]
         assert "too large" in result["reason"]
 
+    def test_rejects_truncated_and_unindexed_data(self, tmp_path):
+        p = make_safetensors_file(tmp_path)
+        p.write_bytes(p.read_bytes()[:-1])
+        result = _validate_safetensors_header(p)
+        assert not result["passed"]
+
+    def test_rejects_duplicate_json_keys(self, tmp_path):
+        p = tmp_path / "duplicate.safetensors"
+        header = (
+            b'{"weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]},'
+            b'"weight":{"dtype":"U8","shape":[1],"data_offsets":[0,1]}}'
+        )
+        p.write_bytes(struct.pack("<Q", len(header)) + header + b"\x00")
+        result = _validate_safetensors_header(p)
+        assert not result["passed"]
+        assert "duplicate" in result["reason"]
+
+    def test_rejects_symlink_and_hardlink(self, tmp_path):
+        target = make_safetensors_file(tmp_path)
+        symlink = tmp_path / "link.safetensors"
+        symlink.symlink_to(target)
+        hardlink = tmp_path / "hardlink.safetensors"
+        hardlink.hardlink_to(target)
+        assert not _validate_safetensors_header(symlink)["passed"]
+        assert not _validate_safetensors_header(hardlink)["passed"]
+
 
 # ---------------------------------------------------------------------------
 # Stage 3: Hash pinning
@@ -343,9 +415,38 @@ class TestStaticScan:
     def test_skipped_when_not_installed_and_not_required(self, tmp_path):
         """When require_scan is False, missing modelscan is acceptable."""
         p = make_gguf_file(tmp_path)
-        policy = {"models": {"require_scan": False}}
+        policy = {
+            "models": {"require_scan": False},
+            "quarantine": {"scanner_missing": "warn-and-skip"},
+        }
         result = check_static_scan(p, policy=policy)
         assert result["passed"]
+
+    def test_missing_passed_field_cannot_default_to_clean(self, tmp_path, monkeypatch):
+        path = make_gguf_file(tmp_path)
+        monkeypatch.setattr(pipeline_module, "_run_modelscan", lambda *_args, **_kwargs: {})
+        for name in (
+            "_run_fickling_scan",
+            "_run_modelaudit",
+            "_check_pickle_polyglot",
+            "_check_file_entropy",
+            "_analyze_weight_distribution",
+            "_run_gguf_guard_scan",
+        ):
+            monkeypatch.setattr(
+                pipeline_module, name, lambda *_args, **_kwargs: {"passed": True}
+            )
+
+        result = check_static_scan(
+            path,
+            policy={
+                "models": {"require_scan": False},
+                "quarantine": {"scanner_missing": "warn-and-skip"},
+            },
+        )
+
+        assert result["passed"] is False
+        assert "malformed verdict" in result["reason"]
 
 
 class TestEntropy:
@@ -446,6 +547,36 @@ class TestDiffusionDeepScan:
         assert not result["passed"]
         assert any("suspicious URL" in i for i in result["issues"])
 
+    def test_component_tuple_and_class_are_strictly_allowlisted(self, tmp_path):
+        directory = make_diffusion_dir(tmp_path, "bad-component-policy")
+        index_path = directory / "model_index.json"
+        index = json.loads(index_path.read_text())
+        index["unet"] = ["attacker_library", "ArbitraryPythonClass", "extra"]
+        index_path.write_text(json.dumps(index))
+
+        result = check_diffusion_config_integrity(directory)
+
+        assert result["passed"] is False
+        assert any("exact [library, class] tuple" in issue for issue in result["issues"])
+
+    def test_weight_bearing_component_requires_weights(self, tmp_path):
+        directory = make_diffusion_dir(tmp_path, "missing-weights")
+        (directory / "unet" / "model.safetensors").unlink()
+
+        result = check_diffusion_config_integrity(directory)
+
+        assert result["passed"] is False
+        assert any("component weights missing: unet" in issue for issue in result["issues"])
+
+    def test_component_requires_strict_json_configuration(self, tmp_path):
+        directory = make_diffusion_dir(tmp_path, "duplicate-config-key")
+        (directory / "unet" / "config.json").write_text('{"size":1,"size":2}')
+
+        result = check_diffusion_config_integrity(directory)
+
+        assert result["passed"] is False
+        assert any("could not safely inspect" in issue for issue in result["issues"])
+
 
 # ---------------------------------------------------------------------------
 # Directory hash
@@ -459,6 +590,25 @@ class TestDirectoryHash:
         assert h1 == h2
         assert len(h1) == 64
 
+    def test_rejects_symlinks_and_ambiguous_tree_entries(self, tmp_path):
+        d = make_diffusion_dir(tmp_path)
+        (d / "escape").symlink_to("/etc/passwd")
+        try:
+            sha256_of_directory(d)
+        except ValueError as exc:
+            assert "symbolic links" in str(exc)
+        else:
+            raise AssertionError("directory hashing followed a symbolic link")
+
+    def test_empty_directory_marker_changes_digest(self, tmp_path):
+        directory = make_diffusion_dir(tmp_path)
+        before = sha256_of_directory(directory)
+        (directory / "unet" / "empty-marker").mkdir()
+
+        after = sha256_of_directory(directory)
+
+        assert after != before
+
 
 # ---------------------------------------------------------------------------
 # Full pipeline orchestrators
@@ -468,7 +618,10 @@ class TestRunPipeline:
     def test_valid_gguf_passes(self, tmp_path):
         p = make_gguf_file(tmp_path)
         h = "a" * 64
-        policy = {"models": {"require_scan": False, "require_behavior_tests": False}}
+        policy = {
+            "models": {"require_scan": False, "require_behavior_tests": False},
+            "quarantine": {"scanner_missing": "warn-and-skip"},
+        }
         result = run_pipeline(p, h, policy)
         assert result["passed"]
         assert "source_policy" in result["details"]
@@ -487,7 +640,10 @@ class TestRunPipelineDirectory:
     def test_valid_diffusion_passes(self, tmp_path):
         d = make_diffusion_dir(tmp_path)
         h = sha256_of_directory(d)
-        policy = {"models": {"require_scan": False}}
+        policy = {
+            "models": {"require_scan": False},
+            "quarantine": {"scanner_missing": "warn-and-skip"},
+        }
         result = run_pipeline_directory(d, h, policy)
         assert result["passed"]
         assert "diffusion_deep_scan" in result["details"]
@@ -591,15 +747,9 @@ class TestGGUFTemplateScan:
 
 class TestPicklePolyglot:
     def test_pickle_polyglot_detection(self, tmp_path):
-        """File with pickle opcodes in header is caught."""
+        """A file whose actual prefix is a pickle stream is caught."""
         p = tmp_path / "fake.safetensors"
-        # Write valid safetensors start, then inject pickle PROTO opcode
-        header = b'{"__metadata__": {}}'
-        with open(p, "wb") as f:
-            f.write(struct.pack("<Q", len(header)))
-            f.write(header)
-            # Inject pickle PROTO v4 opcode in the data region (still within first 8KB)
-            f.write(b"\x80\x04" + b"\x00" * 100)
+        p.write_bytes(b"\x80\x04" + b"\x00" * 100)
         result = _check_pickle_polyglot(p)
         assert not result["passed"]
         assert "pickle polyglot" in result["reason"]
@@ -615,17 +765,23 @@ class TestPicklePolyglot:
         result = _check_pickle_polyglot(p)
         assert result["passed"]
 
-    def test_polyglot_in_format_gate(self, tmp_path):
-        """Format gate catches polyglot files."""
+    def test_weight_bytes_do_not_cause_false_polyglot_result(self, tmp_path):
+        """Arbitrary tensor bytes are data, not a second executable format."""
         p = tmp_path / "poly.safetensors"
-        header = b'{"__metadata__": {}}'
-        with open(p, "wb") as f:
-            f.write(struct.pack("<Q", len(header)))
-            f.write(header)
-            f.write(b"cbuiltins\n" + b"\x00" * 100)
+        data = b"cbuiltins\n" + b"\x00" * 100
+        header = json.dumps(
+            {
+                "weight": {
+                    "dtype": "U8",
+                    "shape": [len(data)],
+                    "data_offsets": [0, len(data)],
+                }
+            },
+            separators=(",", ":"),
+        ).encode()
+        p.write_bytes(struct.pack("<Q", len(header)) + header + data)
         result = check_format_gate(p)
-        assert not result["passed"]
-        assert "polyglot" in result["reason"]
+        assert result["passed"]
 
 
 class TestFicklingGraceful:
@@ -636,6 +792,22 @@ class TestFicklingGraceful:
         assert result["passed"]
         assert "not installed" in result.get("note", "")
 
+    def test_fickling_requires_explicit_safe_boolean(self, tmp_path, monkeypatch):
+        path = make_gguf_file(tmp_path)
+        monkeypatch.setattr(
+            pipeline_module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0, stdout='{"issues": []}', stderr=""
+            ),
+        )
+
+        result = _run_fickling_scan(path)
+
+        assert result["passed"] is False
+        assert result["schema_version"] == 1
+        assert result["verdict"] == "fail"
+
 
 class TestModelAuditGraceful:
     def test_modelaudit_not_installed(self, tmp_path):
@@ -644,6 +816,73 @@ class TestModelAuditGraceful:
         result = _run_modelaudit(p)
         assert result["passed"]
         assert "not installed" in result.get("note", "")
+
+    def test_modelaudit_missing_issues_is_not_clean(self, tmp_path, monkeypatch):
+        path = make_gguf_file(tmp_path)
+        monkeypatch.setattr(
+            pipeline_module.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0, stdout='{"version": "1.2.3"}', stderr=""
+            ),
+        )
+
+        result = _run_modelaudit(path)
+
+        assert result["passed"] is False
+        assert result["verdict"] == "fail"
+
+
+class TestModelScanReportSchema:
+    @staticmethod
+    def report(*, total=1, errors=None, skipped=None):
+        skipped = [] if skipped is None else skipped
+        return {
+            "summary": {
+                "modelscan_version": "0.8.7",
+                "total_issues": 0,
+                "scanned": {
+                    "total_scanned": total,
+                    "scanned_files": ["model.gguf"] if total else [],
+                },
+                "skipped": {
+                    "total_skipped": len(skipped),
+                    "skipped_files": skipped,
+                },
+            },
+            "issues": [],
+            "errors": [] if errors is None else errors,
+        }
+
+    def test_rejects_zero_coverage(self, tmp_path):
+        artifact = tmp_path / "model.gguf"
+
+        with pytest.raises(ValueError, match="positive artifact coverage"):
+            _validated_modelscan_result(
+                self.report(total=0), artifact, "modelscan-api"
+            )
+
+    def test_rejects_reported_errors(self, tmp_path):
+        artifact = tmp_path / "model.gguf"
+        result = _validated_modelscan_result(
+            self.report(errors=[{"category": "PATH"}]),
+            artifact,
+            "modelscan-api",
+        )
+
+        assert result["passed"] is False
+        assert "scan error" in result["reason"]
+
+    def test_rejects_skipped_artifacts(self, tmp_path):
+        artifact = tmp_path / "model.gguf"
+        result = _validated_modelscan_result(
+            self.report(skipped=[{"source": "model.gguf"}]),
+            artifact,
+            "modelscan-api",
+        )
+
+        assert result["passed"] is False
+        assert "skipped" in result["reason"]
 
 
 # ---------------------------------------------------------------------------
@@ -836,6 +1075,40 @@ def _make_gguf_with_tensor(tmp_path: Path, tensor_data: bytes, dtype_id: int = 0
     return p
 
 
+def _make_gguf_with_metadata_and_tensor(tmp_path: Path, tensor_data: bytes) -> Path:
+    """Build a valid GGUF with mixed metadata for bounded-parser regression."""
+    path = tmp_path / "metadata_weight_test.gguf"
+    tensor_name = b"test.weight"
+    metadata = [
+        (b"general.name", 8, b"bounded-parser-regression"),
+        (b"general.alignment", 4, 64),
+    ]
+    with open(path, "wb") as stream:
+        stream.write(b"GGUF")
+        stream.write(struct.pack("<I", 3))
+        stream.write(struct.pack("<Q", 1))
+        stream.write(struct.pack("<Q", len(metadata)))
+        for key, value_type, value in metadata:
+            stream.write(struct.pack("<Q", len(key)))
+            stream.write(key)
+            stream.write(struct.pack("<I", value_type))
+            if value_type == 8:
+                stream.write(struct.pack("<Q", len(value)))
+                stream.write(value)
+            else:
+                stream.write(struct.pack("<I", value))
+        stream.write(struct.pack("<Q", len(tensor_name)))
+        stream.write(tensor_name)
+        stream.write(struct.pack("<I", 1))
+        stream.write(struct.pack("<Q", len(tensor_data) // 4))
+        stream.write(struct.pack("<I", 0))
+        stream.write(struct.pack("<Q", 0))
+        padding = (-stream.tell()) % 64
+        stream.write(b"\x00" * padding)
+        stream.write(tensor_data)
+    return path
+
+
 class TestStatsFromValues:
     def test_normal_distribution(self):
         """Basic stats computation on a known list."""
@@ -922,6 +1195,16 @@ class TestCheckWeightAnomalies:
 
 
 class TestAnalyzeWeightDistribution:
+    def test_gguf_valid_metadata_uses_bounded_value_parser(self, tmp_path):
+        values = [(-1.0 if index % 2 else 1.0) * 0.1 for index in range(256)]
+        tensor_data = struct.pack(f"<{len(values)}f", *values)
+        path = _make_gguf_with_metadata_and_tensor(tmp_path, tensor_data)
+
+        result = _analyze_weight_distribution(path)
+
+        assert result["passed"] is True
+        assert result["tensors_analyzed"] == 1
+
     def test_gguf_normal_weights(self, tmp_path):
         """Normal GGUF weights pass analysis."""
         import random
@@ -982,6 +1265,178 @@ class TestAnalyzeWeightDistribution:
 # ---------------------------------------------------------------------------
 # Garak LLM vulnerability scanner integration
 # ---------------------------------------------------------------------------
+
+
+class TestBoundedBehavioralResponses:
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, amount):
+            assert amount == pipeline_module.MAX_LLAMA_RESPONSE_BYTES + 1
+            return self.body
+
+    @pytest.mark.parametrize(
+        ("body", "error"),
+        [
+            (b"{}", "malformed_response"),
+            (
+                b'{"choices":[{"message":{"content":""}}]}',
+                "empty_response",
+            ),
+            (
+                b"x" * (pipeline_module.MAX_LLAMA_RESPONSE_BYTES + 1),
+                "oversized_response",
+            ),
+        ],
+    )
+    def test_query_rejects_malformed_empty_and_oversized_responses(
+        self, monkeypatch, body, error
+    ):
+        monkeypatch.setattr(
+            pipeline_module,
+            "_http_urlopen",
+            lambda *_args, **_kwargs: self.Response(body),
+        )
+
+        result = _query_llama(9999, [{"role": "user", "content": "test"}])
+
+        assert result == {"ok": False, "error": error}
+
+    def test_query_timeout_is_distinct(self, monkeypatch):
+        def raise_timeout(*_args, **_kwargs):
+            raise TimeoutError
+
+        monkeypatch.setattr(pipeline_module, "_http_urlopen", raise_timeout)
+
+        result = _query_llama(9999, [{"role": "user", "content": "test"}])
+
+        assert result == {"ok": False, "error": "timeout"}
+
+    def test_server_logs_are_not_connected_to_undrained_pipes(
+        self, tmp_path, monkeypatch
+    ):
+        server = tmp_path / "llama-server"
+        server.write_bytes(b"stub")
+        captured = {}
+
+        class Process:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        def fake_popen(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return Process()
+
+        monkeypatch.setattr(pipeline_module, "LLAMA_SERVER_BIN", str(server))
+        monkeypatch.setattr(pipeline_module.subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(pipeline_module, "_wait_for_server", lambda *_args, **_kwargs: False)
+
+        result = check_smoke_test(tmp_path / "model.gguf")
+
+        assert result["passed"] is False
+        assert captured["kwargs"]["stdout"] is pipeline_module.subprocess.DEVNULL
+        assert captured["kwargs"]["stderr"] is pipeline_module.subprocess.DEVNULL
+
+    def test_every_configured_prompt_requires_valid_nonempty_response(
+        self, tmp_path, monkeypatch
+    ):
+        server = tmp_path / "llama-server"
+        server.write_bytes(b"stub")
+
+        class Process:
+            def poll(self):
+                return None
+
+            def terminate(self):
+                return None
+
+            def wait(self, timeout=None):
+                return 0
+
+        responses = iter(
+            [
+                {"ok": True, "content": "A safe response."},
+                {"ok": False, "error": "empty_response"},
+            ]
+        )
+        monkeypatch.setattr(pipeline_module, "LLAMA_SERVER_BIN", str(server))
+        monkeypatch.setattr(
+            pipeline_module.subprocess,
+            "Popen",
+            lambda *_args, **_kwargs: Process(),
+        )
+        monkeypatch.setattr(pipeline_module, "_wait_for_server", lambda *_args, **_kwargs: True)
+        monkeypatch.setattr(
+            pipeline_module,
+            "SMOKE_PROMPTS",
+            [
+                {"role": "user", "content": "first", "category": "baseline"},
+                {"role": "user", "content": "second", "category": "baseline"},
+            ],
+        )
+        monkeypatch.setattr(
+            pipeline_module,
+            "_query_llama",
+            lambda *_args, **_kwargs: next(responses),
+        )
+
+        result = check_smoke_test(tmp_path / "model.gguf")
+
+        assert result["passed"] is False
+        assert result["failed_prompt_index"] == 1
+        assert result["query_error"] == "empty_response"
+
+
+class TestGarakReportValidation:
+    def test_zero_probe_report_is_rejected(self, tmp_path):
+        report = tmp_path / "quarantine_scan.report.jsonl"
+        report.write_text(
+            json.dumps({"entry_type": "eval", "passed": 0, "total_evaluated": 0})
+            + "\n"
+        )
+
+        with pytest.raises(ValueError, match="no evaluated probes"):
+            _parse_garak_report(tmp_path)
+
+    def test_garak_scan_fails_on_zero_probe_report(self, monkeypatch):
+        monkeypatch.setattr(
+            pipeline_module.importlib.util, "find_spec", lambda _name: object()
+        )
+        monkeypatch.setattr(pipeline_module, "package_version", lambda _name: "0.9.0")
+
+        def fake_run(*_args, **kwargs):
+            report_dir = Path(kwargs["env"]["XDG_DATA_HOME"]) / "garak" / "garak_runs"
+            report_dir.mkdir(parents=True)
+            (report_dir / "quarantine_scan.report.jsonl").write_text(
+                json.dumps(
+                    {"entry_type": "eval", "passed": 0, "total_evaluated": 0}
+                )
+                + "\n"
+            )
+            assert kwargs["stdout"] is pipeline_module.subprocess.DEVNULL
+            assert kwargs["stderr"] is pipeline_module.subprocess.DEVNULL
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(pipeline_module.subprocess, "run", fake_run)
+
+        result = _run_garak_scan(port=9999)
+
+        assert result["passed"] is False
+        assert result["verdict"] == "fail"
 
 class TestGarakIntegration:
     def test_garak_not_installed(self):

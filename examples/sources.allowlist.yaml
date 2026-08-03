@@ -7,11 +7,7 @@ version: 1
 models:
   - name: "Hugging Face"
     url_prefix: "https://huggingface.co/"
-    require_signature: false
-    allowed_formats: ["safetensors", "gguf"]
     notes: "Pin exact commit hashes in models.lock.yaml"
 
   - name: "Ollama Library"
     url_prefix: "https://registry.ollama.ai/"
-    require_signature: false
-    allowed_formats: ["gguf"]
