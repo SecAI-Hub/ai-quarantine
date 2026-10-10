@@ -43,11 +43,14 @@ import time
 from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as package_version
 from pathlib import Path
+from typing import Literal, TypedDict
 from urllib.error import URLError
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 import yaml
+
+from .policy_context import PolicyContext
 
 log = logging.getLogger("quarantine.pipeline")
 
@@ -82,12 +85,13 @@ MAX_GARAK_REPORT_ENTRIES = 100_000
 # Stage 1: Source policy gate
 # ---------------------------------------------------------------------------
 
-def _load_source_allowlist() -> list:
+def _load_source_allowlist(policy_context: PolicyContext | None = None) -> list:
     """Load allowed source URL prefixes from sources.allowlist.yaml."""
-    if not SOURCES_ALLOWLIST_PATH.exists():
+    if policy_context is None and not SOURCES_ALLOWLIST_PATH.exists():
         return []
     try:
-        data = _load_trusted_yaml(SOURCES_ALLOWLIST_PATH)
+        data = (_load_trusted_yaml(SOURCES_ALLOWLIST_PATH) if policy_context is None
+                else policy_context.document("sources.allowlist.yaml"))
         entries = data.get("models", [])
         if not isinstance(entries, list):
             raise ValueError("source allowlist models must be a list")
@@ -168,7 +172,8 @@ def _source_matches_prefix(source_url: str, prefix: str) -> bool:
     )
 
 
-def check_source_policy(source_url: str, policy: dict | None = None) -> dict:
+def check_source_policy(source_url: str, policy: dict | None = None, *,
+                        policy_context: PolicyContext | None = None) -> dict:
     """Stage 1: Verify the artifact's source URL is in the allowlist.
 
     If no source URL is provided (e.g. local file import), this stage passes
@@ -196,7 +201,8 @@ def check_source_policy(source_url: str, policy: dict | None = None) -> dict:
             "reason": str(exc),
         }
 
-    allowlist = _load_source_allowlist()
+    allowlist = (_load_source_allowlist() if policy_context is None
+                 else _load_source_allowlist(policy_context))
     if not allowlist:
         # No allowlist configured — fail closed for remote sources
         return {
@@ -1105,12 +1111,13 @@ def _check_json_for_code(json_path: Path, issues: list, base_dir: Path):
 # Stage 3: Integrity gate (hash pinning)
 # ---------------------------------------------------------------------------
 
-def _load_pinned_hashes() -> dict:
+def _load_pinned_hashes(policy_context: PolicyContext | None = None) -> dict:
     """Load filename -> sha256 mapping from models.lock.yaml."""
-    if not MODELS_LOCK_PATH.exists():
+    if policy_context is None and not MODELS_LOCK_PATH.exists():
         return {}
     try:
-        data = _load_trusted_yaml(MODELS_LOCK_PATH)
+        data = (_load_trusted_yaml(MODELS_LOCK_PATH) if policy_context is None
+                else policy_context.document("models.lock.yaml"))
         entries = data.get("models", [])
         if not isinstance(entries, list):
             raise ValueError("models lock entries must be a list")
@@ -1141,6 +1148,8 @@ def check_hash_pin(
     file_hash: str,
     source_url: str = "",
     policy: dict | None = None,
+    *,
+    policy_context: PolicyContext | None = None,
 ) -> dict:
     """Stage 3: Verify hash against pinned value (if any).
 
@@ -1149,7 +1158,8 @@ def check_hash_pin(
     imports (source_url is empty) we allow first-install TOFU but note that
     the hash must be pinned before the next promotion.
     """
-    pins = _load_pinned_hashes()
+    pins = (_load_pinned_hashes() if policy_context is None
+            else _load_pinned_hashes(policy_context))
     if filename in pins:
         expected = pins[filename]
         if file_hash == expected:
@@ -1239,7 +1249,7 @@ def sha256_of_directory(dir_path: Path) -> str:
 # Stage 4: Provenance gate (cosign / signature verification)
 # ---------------------------------------------------------------------------
 
-def check_provenance(artifact_path: Path, source_url: str) -> dict:
+def check_provenance(artifact_path: Path, source_url: str, *, runner=None) -> dict:
     """Stage 4: Verify cryptographic provenance where available.
 
     For container images: cosign verify.
@@ -1255,7 +1265,7 @@ def check_provenance(artifact_path: Path, source_url: str) -> dict:
 
     cosign_version = None
     try:
-        result = subprocess.run(
+        result = (subprocess.run if runner is None else runner)(
             [COSIGN_BIN, "version"],
             capture_output=True, text=True, timeout=10,
         )
@@ -1267,7 +1277,7 @@ def check_provenance(artifact_path: Path, source_url: str) -> dict:
 
     if has_cosign and ("ghcr.io" in source_url or "docker.io" in source_url):
         try:
-            result = subprocess.run(
+            result = (subprocess.run if runner is None else runner)(
                 [COSIGN_BIN, "verify", "--key", "/etc/secure-ai/keys/cosign.pub", source_url],
                 capture_output=True, text=True, timeout=60,
             )
@@ -1329,131 +1339,260 @@ def _external_scanner_result(
     }
 
 
+ScannerVerdict = Literal["pass", "fail", "not_applicable", "unavailable", "error"]
+
+
+class ScannerOutcome(TypedDict):
+    schema_version: int
+    passed: bool
+    verdict: ScannerVerdict
+    available: bool | None
+    scanner: str
+    scanner_version: str | None
+    reason: str
+    scanned_count: int
+
+
+def _static_scanner_result(
+    verdict: ScannerVerdict, scanner: str, *, reason: str,
+    scanner_version: str | None = None, scanned_count: int = 0, **evidence,
+) -> ScannerOutcome:
+    """A nonapplicable or missing scanner is never positive scan evidence."""
+    if verdict == "pass" and (
+        type(scanned_count) is not int or scanned_count <= 0
+        or not isinstance(scanner_version, str) or scanner_version.strip() in {"", "unknown"}
+    ):
+        verdict, reason, scanned_count = "error", "scanner lacks versioned positive coverage", 0
+    return {
+        **evidence,
+        "schema_version": 2,
+        "passed": verdict == "pass",
+        "verdict": verdict,
+        "available": (True if verdict in {"pass", "fail"} else
+                      False if verdict == "unavailable" else None),
+        "scanner": scanner,
+        "scanner_version": scanner_version,
+        "reason": reason,
+        "scanned_count": scanned_count,
+    }
+
+
+def _static_applicability(path: Path, scanner: str) -> ScannerOutcome | None:
+    """Validate safe formats before excluding a parser; errors cannot become N/A."""
+    extension = path.suffix.lower()
+    if extension in {".gguf", ".safetensors"}:
+        try:
+            result = check_format_gate(path)
+        except (OSError, ValueError, TypeError, struct.error) as exc:
+            return _static_scanner_result(
+                "error", scanner, reason=f"format validation failed: {type(exc).__name__}"
+            )
+        if result.get("passed") is not True:
+            return _static_scanner_result(
+                "fail", scanner, reason=f"format validation failed: {result.get('reason', 'unknown')}"
+            )
+        if scanner in {"modelscan", "fickling"} or (
+            scanner == "gguf-guard" and extension == ".safetensors"
+        ):
+            return _static_scanner_result(
+                "not_applicable", scanner,
+                reason=f"{scanner} does not scan validated {extension[1:]} artifacts",
+                artifact_format=extension[1:],
+            )
+        return None
+    applicable = {
+        "modelscan": {".pkl", ".pickle", ".joblib", ".dill", ".dat", ".data", ".bin", ".pt", ".pth",
+                      ".ckpt", ".npy", ".npz", ".h5", ".keras", ".pb", ".zip"},
+        "fickling": {".pkl", ".pickle", ".pt", ".pth", ".bin", ".ckpt"},
+    }
+    if extension not in applicable.get(scanner, set()):
+        return _static_scanner_result(
+            "error", scanner, reason=f"unsupported artifact format: {extension or '(none)'}"
+        )
+    try:
+        handle, _size = _open_regular_file(path)
+        handle.close()
+    except (OSError, ValueError) as exc:
+        return _static_scanner_result(
+            "error", scanner, reason=f"artifact unavailable: {type(exc).__name__}"
+        )
+    return None
+
+
+def _scanner_cli_version(binary: str, scanner: str, *, runner=None) -> str:
+    """Query the same trusted executable used for scanning, never adapter metadata."""
+    result = (subprocess.run if runner is None else runner)(
+        [binary, "--version"], stdin=subprocess.DEVNULL,
+        capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1", "NO_ANALYTICS": "1"},
+    )
+    patterns = {"modelaudit": r"modelaudit, version ([0-9]+[.][0-9]+[.][0-9]+)",
+                "fickling": r"([0-9]+[.][0-9]+[.][0-9]+)"}
+    match = re.fullmatch(patterns[scanner], result.stdout.strip())
+    if result.returncode != 0 or match is None:
+        raise ValueError(f"{scanner} did not identify its version")
+    version = match.group(1)
+    supported = {"modelaudit": {"0.2.52"}, "fickling": {"0.1.12"}}
+    if version not in supported[scanner]:
+        raise ValueError(f"unsupported {scanner} report version")
+    return version
+
+
 def _run_fickling_scan(filepath: Path) -> dict:
-    """Run Fickling in allowlist mode to detect pickle-based attacks."""
+    """Invoke the pickle parser only for its applicable library inputs."""
+    applicability = _static_applicability(filepath, "fickling")
+    if applicability is not None:
+        return applicability
+    version = None
     try:
-        result = subprocess.run(
-            [FICKLING_BIN, "--check-safety", "--json", str(filepath)],
-            capture_output=True, text=True, timeout=120,
-        )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            if not isinstance(data, dict) or not isinstance(data.get("safe"), bool):
-                raise ValueError("fickling output lacks an explicit safe verdict")
-            issues = data.get("issues", [])
-            if not isinstance(issues, list):
-                raise ValueError("fickling issues field is invalid")
-            if data["safe"] is not True or issues:
-                return _external_scanner_result(
-                    passed=False,
-                    scanner="fickling",
-                    reason="fickling flagged unsafe operations",
-                    details=issues,
-                    scanner_version=_get_fickling_version(),
-                )
-            return _external_scanner_result(
-                passed=True,
-                scanner="fickling",
-                scanner_version=_get_fickling_version(),
+        version = _scanner_cli_version(FICKLING_BIN, "fickling")
+        # --json is an abbreviation of --json-output in Fickling 0.1.12,
+        # not a stdout flag. Keep output separate from the input artifact.
+        with tempfile.TemporaryDirectory(prefix="secai-fickling-") as temp_dir:
+            report_path = Path(temp_dir) / "report.json"
+            result = subprocess.run(
+                [FICKLING_BIN, "--check-safety", "--json-output", str(report_path), str(filepath)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=120,
             )
-        return _external_scanner_result(
-            passed=False,
-            scanner="fickling",
-            reason="fickling exited with an error",
+            try:
+                raw_report = _read_bounded_regular_file(report_path, max_bytes=16 * 1024 * 1024)
+            except OSError as exc:
+                raise ValueError("fickling report is missing or unreadable") from exc
+            data = _decode_bounded_json(raw_report)
+        severities = {"LIKELY_SAFE", "POSSIBLY_UNSAFE", "SUSPICIOUS", "LIKELY_UNSAFE",
+                      "LIKELY_OVERTLY_MALICIOUS", "OVERTLY_MALICIOUS"}
+        if (not isinstance(data, dict) or set(data) != {"severity", "analysis", "detailed_results"}
+                or data.get("severity") not in severities
+                or not isinstance(data.get("analysis"), str) or not data["analysis"].strip()
+                or not isinstance(data.get("detailed_results"), dict)):
+            raise ValueError("fickling output has an unsupported classification schema")
+        safe = data["severity"] == "LIKELY_SAFE"
+        if result.returncode != (0 if safe else 1) or (safe and data["detailed_results"]):
+            raise ValueError("fickling exit/details contradict its classification")
+        return _static_scanner_result(
+            "pass" if safe else "fail", "fickling",
+            reason=f"fickling classification: {data['severity']}",
+            scanner_version=version, scanned_count=1,
+            classification=data["severity"],
         )
     except FileNotFoundError:
-        return _external_scanner_result(
-            passed=True,
-            available=False,
-            scanner="fickling",
-            note="fickling not installed, skipped",
+        return _static_scanner_result(
+            "unavailable", "fickling", reason="required fickling scanner is not installed"
         )
     except subprocess.TimeoutExpired:
-        return _external_scanner_result(
-            passed=False, scanner="fickling", reason="fickling scan timed out"
-        )
-    except (json.JSONDecodeError, OSError, ValueError) as exc:
-        return _external_scanner_result(
-            passed=False,
-            scanner="fickling",
-            reason=f"fickling output error: {type(exc).__name__}",
+        return _static_scanner_result("error", "fickling", reason="fickling scan timed out")
+    except (OSError, UnicodeError, ValueError, TypeError, RecursionError) as exc:
+        return _static_scanner_result(
+            "error", "fickling", reason=f"fickling output error: {type(exc).__name__}", scanner_version=version
         )
 
 
-def _get_fickling_version() -> str:
+def _validated_modelaudit_result(data: object, filepath: Path, version: str, returncode: int) -> dict:
+    """ModelAudit 0.2.52 reports completion separately from its CLI version."""
+    if not isinstance(data, dict):
+        raise ValueError("modelaudit report root is invalid")
+    supported_fields = {
+        "bytes_scanned", "issues", "checks", "files_scanned", "assets", "has_errors",
+        "scanner_names", "scanner_selection", "file_metadata", "content_hash", "start_time",
+        "duration", "total_checks", "passed_checks", "failed_checks", "success",
+        "version", "dry_run", "metadata",
+    }
+    if set(data) - supported_fields or ("version" in data and data["version"] != version):
+        raise ValueError("modelaudit report schema/version is unsupported")
+    issues, checks = data.get("issues"), data.get("checks")
+    if (not isinstance(issues, list) or not isinstance(checks, list)
+            or any(not isinstance(i, dict) or i.get("severity") not in {"debug", "info", "warning", "critical"} for i in issues)
+            or any(not isinstance(c, dict) or c.get("status") not in {"passed", "failed", "skipped"} for c in checks)
+            or type(data.get("has_errors")) is not bool or type(data.get("success")) is not bool):
+        raise ValueError("modelaudit result fields are invalid")
+    for field in ("files_scanned", "bytes_scanned", "total_checks"):
+        if type(data.get(field)) is not int or data[field] <= 0:
+            raise ValueError(f"modelaudit lacks positive {field} coverage")
+    for field in ("passed_checks", "failed_checks"):
+        if type(data.get(field)) is not int or data[field] < 0:
+            raise ValueError("modelaudit check counters are invalid")
+    if (data["total_checks"] != len(checks)
+            or data["passed_checks"] != sum(c["status"] == "passed" for c in checks)
+            or data["failed_checks"] != sum(c["status"] == "failed" for c in checks)):
+        raise ValueError("modelaudit check counters are inconsistent")
+    if data.get("dry_run", False) is not False or _incomplete_scanner_report(data):
+        raise ValueError("modelaudit reported incomplete analysis")
+    unsafe = any(i["severity"] in {"warning", "critical"} for i in issues) or data["failed_checks"] > 0
+    if unsafe:
+        if returncode != 1:
+            raise ValueError("modelaudit successful exit contradicts unsafe evidence")
+        return _static_scanner_result("fail", "modelaudit", reason="modelaudit reported unsafe evidence",
+                                      scanner_version=version, scanned_count=data["files_scanned"])
+    if (returncode != 0 or data["success"] is not True or data["has_errors"] is not False
+            or any(c["status"] != "passed" for c in checks)):
+        raise ValueError("modelaudit did not establish successful completion")
+    handle, size = _open_regular_file(filepath)
+    handle.close()
+    expected_scanner = {".gguf": "gguf", ".safetensors": "safetensors"}.get(filepath.suffix.lower())
+    if expected_scanner is None or data.get("scanner_names") != [expected_scanner]:
+        raise ValueError("modelaudit report lacks the applicable format scanner")
+    metadata = data.get("file_metadata")
+    record = metadata.get(str(filepath)) if isinstance(metadata, dict) else None
+    # The GGUF scanner counts its parser cursor, not all tensor bytes.
+    # Keep actual scan coverage distinct from the artifact's verified size.
+    if (data["files_scanned"] != 1 or data["bytes_scanned"] > size
+            or not isinstance(record, dict) or type(record.get("file_size")) is not int
+            or record["file_size"] != size or len(metadata) != 1):
+        raise ValueError("modelaudit report does not cover the requested file")
+    return _static_scanner_result(
+        "pass", "modelaudit", reason="complete positive coverage of requested artifact",
+        scanner_version=version, scanned_count=1, bytes_scanned=data["bytes_scanned"],
+        artifact_size_bytes=size, total_checks=data["total_checks"],
+    )
+
+
+def _run_modelaudit(filepath: Path, *, runner=None) -> dict:
+    """Require complete evidence from the version-identified trusted CLI."""
+    applicability = _static_applicability(filepath, "modelaudit")
+    if applicability is not None:
+        return applicability
+    filepath = filepath.absolute()
+    version = None
     try:
-        return package_version("fickling")
-    except PackageNotFoundError:
-        return "unknown"
-
-
-def _run_modelaudit(filepath: Path) -> dict:
-    """Run ModelAudit as a second-opinion scanner (optional)."""
-    try:
-        result = subprocess.run(
-            [MODELAUDIT_BIN, "scan", str(filepath), "--format", "json"],
-            capture_output=True, text=True, timeout=300,
+        version = _scanner_cli_version(MODELAUDIT_BIN, "modelaudit", **({} if runner is None else {"runner": runner}))
+        before = filepath.stat()
+        result = (subprocess.run if runner is None else runner)(
+            [MODELAUDIT_BIN, "scan", str(filepath), "--format", "json", "--no-cache", "--no-whitelist"],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300,
+            env={**os.environ, "PROMPTFOO_DISABLE_TELEMETRY": "1", "NO_ANALYTICS": "1"},
         )
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            if not isinstance(data, dict) or "issues" not in data:
-                raise ValueError("modelaudit output lacks issues")
-            issues = data["issues"]
-            version = data.get("version")
-            if (
-                not isinstance(issues, list)
-                or not isinstance(version, str)
-                or not version.strip()
-                or any(
-                    not isinstance(issue, dict)
-                    or not isinstance(issue.get("severity"), str)
-                    or issue["severity"].lower()
-                    not in {"critical", "high", "medium", "low", "info"}
-                    for issue in issues
-                )
-            ):
-                raise ValueError("modelaudit output schema is invalid")
-            critical = [
-                issue
-                for issue in issues
-                if issue["severity"].lower() in ("critical", "high")
-            ]
-            if critical:
-                return _external_scanner_result(
-                    passed=False,
-                    scanner="modelaudit",
-                    reason=f"{len(critical)} critical/high issues found",
-                    issues=critical,
-                    scanner_version=version,
-                )
-            return _external_scanner_result(
-                passed=True,
-                scanner="modelaudit",
-                note=f"{len(issues)} low/info issues",
-                scanner_version=version,
-            )
-        return _external_scanner_result(
-            passed=False,
-            scanner="modelaudit",
-            reason="modelaudit exited with an error",
-        )
+        after = filepath.stat()
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns
+        ):
+            raise ValueError("artifact changed during ModelAudit scan")
+        data = _decode_bounded_json(result.stdout.encode("utf-8", errors="strict"))
+        return _validated_modelaudit_result(data, filepath, version, result.returncode)
     except FileNotFoundError:
-        return _external_scanner_result(
-            passed=True,
-            available=False,
-            scanner="modelaudit",
-            note="modelaudit not installed, skipped",
+        return _static_scanner_result(
+            "unavailable", "modelaudit", reason="required modelaudit scanner or artifact is unavailable",
+            scanner_version=version,
         )
     except subprocess.TimeoutExpired:
-        return _external_scanner_result(
-            passed=False, scanner="modelaudit", reason="modelaudit scan timed out"
+        return _static_scanner_result("error", "modelaudit", reason="modelaudit scan timed out", scanner_version=version)
+    except (OSError, UnicodeError, TypeError, ValueError, RecursionError) as exc:
+        return _static_scanner_result(
+            "error", "modelaudit", reason=f"modelaudit output error: {type(exc).__name__}", scanner_version=version,
         )
-    except (json.JSONDecodeError, OSError, TypeError, ValueError) as exc:
-        return _external_scanner_result(
-            passed=False,
-            scanner="modelaudit",
-            reason=f"modelaudit output error: {type(exc).__name__}",
-        )
+
+
+def _incomplete_scanner_report(value: object) -> bool:
+    """Do not let nested operational/partial-coverage markers become success."""
+    if isinstance(value, dict):
+        if (value.get("operational_error") or value.get("analysis_incomplete")
+                or value.get("scan_outcome") == "inconclusive"
+                or value.get("scan_outcome_reason") or value.get("scan_outcome_reasons")):
+            return True
+        return any(_incomplete_scanner_report(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_incomplete_scanner_report(item) for item in value)
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1812,92 +1951,73 @@ def _check_weight_anomalies(tensor_name: str, stats: dict) -> list:
 
 
 def _run_gguf_guard_scan(artifact_path: Path, policy: dict | None = None,
-                         reference_path: str | None = None) -> dict:
-    """Run gguf-guard static analysis on a GGUF model file.
-
-    gguf-guard provides deep weight-level anomaly detection including:
-    - Layered anomaly scoring (tensor-local, cross-layer, model-global, reference)
-    - Quant-format-aware block analysis (scale entropy, repeated blocks, saturation)
-    - Robust statistics (median/MAD, trimmed mean, Tukey fences)
-    - Structural policy validation (offsets, overlaps, metadata, tensor shapes)
-    - Model family identification (llama, mistral, mixtral, qwen2, gemma, phi)
-
-    Returns scan result with score, anomalies, and pass/fail verdict.
-    """
-    if artifact_path.suffix.lower() != ".gguf":
-        return {"passed": True, "scanner": "gguf-guard", "note": "not a GGUF file, skipped"}
-
-    policy_was_supplied = policy is not None
-    if policy is None:
-        policy = {}
-    gguf_guard_policy = policy.get("gguf_guard", {})
+                         reference_path: str | None = None, *, runner=None) -> dict:
+    """Require the guard's explicit completed scan verdict for a valid GGUF."""
+    applicability = _static_applicability(artifact_path, "gguf-guard")
+    if applicability is not None:
+        return applicability
     try:
-        required_setting = gguf_guard_policy.get("required", False)
-        if not isinstance(required_setting, bool):
+        required_setting = (policy or {}).get("gguf_guard", {}).get("required", False)
+        if type(required_setting) is not bool:
             raise ValueError("gguf_guard.required policy is invalid")
-        required = required_setting or (
-            policy_was_supplied and _scanner_fail_closed(policy)
-        )
-    except ValueError as exc:
-        return {"passed": False, "scanner": "gguf-guard", "reason": str(exc)}
-
+        _scanner_fail_closed(policy)
+    except (TypeError, AttributeError, ValueError) as exc:
+        return _static_scanner_result("error", "gguf-guard", reason=str(exc))
     try:
         cmd = [GGUF_GUARD_BIN, "scan", "--quiet"]
         if reference_path:
             cmd.extend(["--reference", reference_path])
         cmd.append(str(artifact_path))
-
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=600,
+        result = (subprocess.run if runner is None else runner)(cmd, capture_output=True, text=True, timeout=600)
+        output = result.stdout.strip()
+        match = re.fullmatch(r"(PASS|WARN|FAIL) score=([0-9]+[.][0-9]+) ([^\r\n]+)", output)
+        if match is None or result.returncode not in {0, 2}:
+            raise ValueError("gguf-guard did not report a completed scan")
+        label, score = match.group(1), float(match.group(2))
+        summary = match.group(3)
+        clean = re.fullmatch(r"no anomalies detected across ([0-9]+) tensors", summary)
+        findings = re.fullmatch(
+            r"([0-9]+) anomalies \(([0-9]+) critical, ([0-9]+) warning, ([0-9]+) info\) across ([0-9]+) tensors",
+            summary,
+        )
+        if clean:
+            tensor_count, critical_count = int(clean.group(1)), 0
+        elif findings:
+            total, critical_count, warning_count, info_count, tensor_count = map(int, findings.groups())
+            if total != critical_count + warning_count + info_count:
+                raise ValueError("gguf-guard anomaly counters are inconsistent")
+        else:
+            raise ValueError("gguf-guard coverage summary is invalid")
+        if tensor_count <= 0 or (critical_count > 0 and label != "FAIL"):
+            raise ValueError("gguf-guard lacks positive safe tensor coverage")
+        if not 0 <= score <= 1 or (label == "FAIL") != (result.returncode == 2):
+            raise ValueError("gguf-guard exit code contradicted its verdict")
+        if label != "FAIL" and score > 0.5:
+            raise ValueError("gguf-guard score contradicted its verdict")
+        version_result = (subprocess.run if runner is None else runner)(
+            [GGUF_GUARD_BIN, "--version"], capture_output=True, text=True, timeout=5,
+        )
+        version_match = re.fullmatch(r"gguf-guard ([0-9]+[.][0-9]+[.][0-9]+)", version_result.stdout.strip())
+        if version_result.returncode != 0 or version_match is None or version_match.group(1) != "0.2.0":
+            raise ValueError("gguf-guard version is unavailable")
+        return _static_scanner_result(
+            "fail" if label == "FAIL" else "pass", "gguf-guard",
+            reason=f"gguf-guard completed scan: {label}", scanner_version=version_match.group(1),
+            scanned_count=1, tensors_analyzed=tensor_count, output=output, exit_code=result.returncode,
+        )
+    except FileNotFoundError:
+        return _static_scanner_result(
+            "unavailable", "gguf-guard", reason="gguf-guard required but not installed"
+        )
+    except subprocess.TimeoutExpired:
+        return _static_scanner_result("error", "gguf-guard", reason="gguf-guard scan timed out")
+    except (OSError, UnicodeError, ValueError, TypeError) as exc:
+        return _static_scanner_result(
+            "error", "gguf-guard", reason=f"gguf-guard output error: {type(exc).__name__}"
         )
 
-        output = result.stdout.strip()
 
-        if result.returncode == 0:
-            # PASS
-            return {
-                "passed": True,
-                "scanner": "gguf-guard",
-                "output": output,
-                "exit_code": 0,
-            }
-        elif result.returncode == 2:
-            # FAIL — score exceeded threshold
-            return {
-                "passed": False,
-                "scanner": "gguf-guard",
-                "reason": f"gguf-guard scan failed: {output}",
-                "output": output,
-                "exit_code": 2,
-            }
-        else:
-            # Error
-            log.warning("gguf-guard error (exit %d): %s", result.returncode, result.stderr[:500])
-            return {
-                "passed": not required,
-                "scanner": "gguf-guard",
-                "reason" if required else "note": "gguf-guard exited with an error",
-                "exit_code": result.returncode,
-            }
-
-    except FileNotFoundError:
-        if required:
-            return {"passed": False, "scanner": "gguf-guard", "reason": "gguf-guard required but not installed"}
-        log.info("gguf-guard not installed; skipping GGUF integrity scan")
-        return {"passed": True, "scanner": "gguf-guard", "note": "not installed, skipped"}
-    except subprocess.TimeoutExpired:
-        log.warning("gguf-guard timed out after 600s")
-        return {"passed": False, "scanner": "gguf-guard", "reason": "gguf-guard scan timed out"}
-    except (OSError, ValueError) as exc:
-        log.warning("gguf-guard error: %s", type(exc).__name__)
-        return {
-            "passed": not required,
-            "scanner": "gguf-guard",
-            "reason" if required else "note": f"gguf-guard error: {type(exc).__name__}",
-        }
-
-
-def _run_gguf_guard_manifest(artifact_path: Path, output_path: Path) -> dict:
+def _run_gguf_guard_manifest(artifact_path: Path, output_path: Path, *, runner=None) -> dict:
     """Generate a gguf-guard per-tensor integrity manifest for a GGUF file.
 
     The manifest contains SHA-256 hashes for each tensor and a Merkle tree root,
@@ -1907,7 +2027,7 @@ def _run_gguf_guard_manifest(artifact_path: Path, output_path: Path) -> dict:
         return {"generated": False, "note": "not a GGUF file"}
 
     try:
-        result = subprocess.run(
+        result = (subprocess.run if runner is None else runner)(
             [GGUF_GUARD_BIN, "manifest", "--output", str(output_path), str(artifact_path)],
             capture_output=True, text=True, timeout=600,
         )
@@ -1923,7 +2043,7 @@ def _run_gguf_guard_manifest(artifact_path: Path, output_path: Path) -> dict:
         return {"generated": False, "error": str(e)}
 
 
-def _run_gguf_guard_fingerprint(artifact_path: Path) -> dict | None:
+def _run_gguf_guard_fingerprint(artifact_path: Path, *, runner=None) -> dict | None:
     """Generate a gguf-guard structural fingerprint for a GGUF file.
 
     Returns fingerprint dict (file_hash, structure_hash, quant_type, etc.) or None.
@@ -1932,7 +2052,7 @@ def _run_gguf_guard_fingerprint(artifact_path: Path) -> dict | None:
         return None
 
     try:
-        result = subprocess.run(
+        result = (subprocess.run if runner is None else runner)(
             [GGUF_GUARD_BIN, "fingerprint", str(artifact_path)],
             capture_output=True, text=True, timeout=120,
         )
@@ -1946,79 +2066,86 @@ def _run_gguf_guard_fingerprint(artifact_path: Path) -> dict | None:
         return None
 
 
-def check_static_scan(artifact_path: Path, policy: dict | None = None) -> dict:
-    """Stage 5: Run modelscan + fickling + modelaudit + entropy + weight analysis + gguf-guard."""
-    if policy is None:
-        policy = {}
-    results = {}
+def _valid_static_outcome(value: object, *, allow_not_applicable: bool) -> bool:
+    if (not isinstance(value, dict) or type(value.get("schema_version")) is not int or value["schema_version"] != 2
+            or not set(ScannerOutcome.__annotations__).issubset(value)):
+        return False
+    verdict = value.get("verdict")
+    count = value.get("scanned_count")
+    if (not isinstance(verdict, str)
+            or verdict not in {"pass", "fail", "not_applicable", "unavailable", "error"}
+            or type(value.get("passed")) is not bool
+            or value["passed"] != (verdict == "pass")
+            or type(count) is not int or count < 0
+            or not isinstance(value.get("reason"), str) or not value["reason"]):
+        return False
+    expected_available = (True if verdict in {"pass", "fail"} else
+                          False if verdict == "unavailable" else None)
+    if value.get("available") is not expected_available:
+        return False
+    if verdict == "not_applicable":
+        return allow_not_applicable and count == 0 and value.get("scanner_version") is None
+    if verdict == "pass":
+        version = value.get("scanner_version")
+        return count > 0 and isinstance(version, str) and version.strip() not in {"", "unknown"}
+    return True
+
+
+def check_static_scan(artifact_path: Path, policy: dict | None = None, *, runner=None) -> dict:
+    """Stage 5: require all applicable gates; retain nonapplicable evidence."""
+    policy = {} if policy is None else policy
     try:
-        fail_closed = _scanner_fail_closed(policy)
-    except ValueError as exc:
-        return {"passed": False, "reason": str(exc), "details": {}}
+        _scanner_fail_closed(policy)
+        if type(policy.get("models", {}).get("require_scan", True)) is not bool:
+            raise ValueError("models.require_scan policy is invalid")
+        format_result = check_format_gate(artifact_path, policy=policy)
+    except (OSError, ValueError, TypeError, AttributeError) as exc:
+        return {"passed": False, "reason": f"static scan policy/format error: {type(exc).__name__}", "details": {}}
+    if format_result.get("passed") is not True:
+        return {"passed": False, "reason": format_result.get("reason", "invalid format"),
+                "details": {"format_gate": format_result}, "scanner": "format_gate"}
 
-    # 1. ModelScan (existing)
-    ms_result = _run_modelscan(artifact_path, policy=policy)
-    results["modelscan"] = ms_result
+    runner_args = {} if runner is None else {"runner": runner}
+    results = {
+        "modelscan": _run_modelscan(artifact_path, policy=policy),
+        "fickling": _run_fickling_scan(artifact_path),
+        "modelaudit": _run_modelaudit(artifact_path, **runner_args),
+        "polyglot_check": _check_pickle_polyglot(artifact_path),
+        "entropy": _check_file_entropy(artifact_path),
+        "weight_stats": _analyze_weight_distribution(artifact_path),
+        "gguf_guard": _run_gguf_guard_scan(artifact_path, policy=policy, **runner_args),
+    }
+    # This allowlist derives from the already validated format, never a scanner report.
+    nonapplicable = {"modelscan", "fickling"}
+    if artifact_path.suffix.lower() == ".safetensors":
+        nonapplicable.add("gguf_guard")
+    external = {"modelscan", "fickling", "modelaudit", "gguf_guard"}
+    for name, result in list(results.items()):
+        if name in external:
+            valid = _valid_static_outcome(result, allow_not_applicable=name in nonapplicable)
+            if valid:
+                valid = result.get("scanner") == {"gguf_guard": "gguf-guard"}.get(name, name)
+            if valid and name in nonapplicable:
+                valid = result["verdict"] == "not_applicable"
+        else:
+            valid = isinstance(result, dict) and type(result.get("passed")) is bool
+        if not valid:
+            results[name] = _static_scanner_result(
+                "error", name, reason=f"{name} returned a malformed verdict"
+            )
+        elif name == "weight_stats":
+            if result.get("operational_error"):
+                results[name] = {**result, "passed": False, "reason": "weight analysis failed operationally"}
+            elif result["passed"] and (type(result.get("tensors_analyzed")) is not int or result["tensors_analyzed"] <= 0):
+                results[name] = {**result, "passed": False, "reason": "weight analysis lacks positive tensor coverage"}
 
-    # 2. Fickling (new, optional)
-    fk_result = _run_fickling_scan(artifact_path)
-    results["fickling"] = fk_result
-
-    # 3. ModelAudit (new, optional)
-    ma_result = _run_modelaudit(artifact_path)
-    results["modelaudit"] = ma_result
-
-    # 4. Polyglot check (new, always runs, no external dep)
-    pg_result = _check_pickle_polyglot(artifact_path)
-    results["polyglot_check"] = pg_result
-
-    # 5. Entropy analysis (existing)
-    entropy_result = _check_file_entropy(artifact_path)
-    results["entropy"] = entropy_result
-
-    # 6. Weight distribution analysis (new, no external dep)
-    weight_result = _analyze_weight_distribution(artifact_path)
-    results["weight_stats"] = weight_result
-
-    # 7. gguf-guard deep integrity scan (GGUF files only)
-    gguf_guard_result = _run_gguf_guard_scan(artifact_path, policy=policy)
-    results["gguf_guard"] = gguf_guard_result
-
-    for scanner_name, scanner_result in list(results.items()):
-        if (
-            not isinstance(scanner_result, dict)
-            or not isinstance(scanner_result.get("passed"), bool)
-        ):
-            results[scanner_name] = {
-                "passed": False,
-                "reason": f"{scanner_name} returned a malformed verdict",
-            }
-
-    if fail_closed:
-        for scanner_name in ("modelscan", "fickling", "modelaudit", "gguf_guard"):
-            scanner_result = results[scanner_name]
-            if (
-                scanner_result.get("available") is False
-                and scanner_result["passed"]
-            ):
-                scanner_result["passed"] = False
-                scanner_result["reason"] = f"{scanner_name} is required but unavailable"
-        if results["weight_stats"].get("operational_error"):
-            results["weight_stats"]["passed"] = False
-            results["weight_stats"]["reason"] = "weight analysis failed operationally"
-
-    # Overall: fail if ANY scanner fails
-    failed = [key for key, value in results.items() if not value["passed"]]
+    failed = [name for name, result in results.items()
+              if not result["passed"] and not (
+                  name in nonapplicable and result.get("verdict") == "not_applicable")]
     if failed:
-        first_fail = failed[0]
-        reason = results[first_fail].get("reason", "unknown")
-        return {
-            "passed": False,
-            "reason": f"{first_fail}: {reason}",
-            "details": results,
-            "scanner": first_fail,
-        }
-
+        first = failed[0]
+        return {"passed": False, "reason": f"{first}: {results[first].get('reason', 'unknown')}",
+                "details": results, "scanner": first}
     return {"passed": True, "details": results, "scanner": "all-static"}
 
 
@@ -2045,7 +2172,7 @@ def _validated_modelscan_result(data: object, artifact_path: Path, scanner: str)
     version = summary.get("modelscan_version")
     scanned = summary.get("scanned")
     skipped = summary.get("skipped")
-    if not isinstance(version, str) or not version.strip():
+    if not isinstance(version, str) or version.strip() in {"", "unknown"}:
         raise ValueError("modelscan version is missing")
     if not isinstance(scanned, dict) or not isinstance(skipped, dict):
         raise ValueError("modelscan coverage summary is invalid")
@@ -2060,6 +2187,7 @@ def _validated_modelscan_result(data: object, artifact_path: Path, scanner: str)
         or not isinstance(scanned_files, list)
         or len(scanned_files) != total_scanned
         or any(not isinstance(item, str) or not item for item in scanned_files)
+        or len(set(scanned_files)) != len(scanned_files)
     ):
         raise ValueError("modelscan did not report positive artifact coverage")
     if (
@@ -2070,9 +2198,8 @@ def _validated_modelscan_result(data: object, artifact_path: Path, scanner: str)
         or skipped_files
         or any(not isinstance(item, dict) for item in skipped_files)
     ):
-        return _external_scanner_result(
-            passed=False,
-            scanner=scanner,
+        return _static_scanner_result(
+            "error", scanner,
             reason="modelscan skipped one or more expected artifacts",
             scanner_version=version,
             skipped_count=total_skipped if isinstance(total_skipped, int) else None,
@@ -2086,24 +2213,22 @@ def _validated_modelscan_result(data: object, artifact_path: Path, scanner: str)
     if not covered:
         raise ValueError("modelscan report does not cover the requested artifact")
     if errors:
-        return _external_scanner_result(
-            passed=False,
-            scanner=scanner,
+        return _static_scanner_result(
+            "error", scanner,
             reason=f"modelscan reported {len(errors)} scan error(s)",
             scanner_version=version,
             error_count=len(errors),
         )
     if issues:
-        return _external_scanner_result(
-            passed=False,
-            scanner=scanner,
+        return _static_scanner_result(
+            "fail", scanner,
             reason=f"modelscan found {len(issues)} issue(s)",
             scanner_version=version,
             details=issues,
         )
-    return _external_scanner_result(
-        passed=True,
-        scanner=scanner,
+    return _static_scanner_result(
+        "pass", scanner,
+        reason="complete positive coverage of requested artifact",
         scanner_version=version,
         scanned_count=total_scanned,
     )
@@ -2112,31 +2237,42 @@ def _validated_modelscan_result(data: object, artifact_path: Path, scanner: str)
 def _run_modelscan(artifact_path: Path, policy: dict | None = None) -> dict:
     """Run modelscan via Python API or CLI.
 
-    If ``policy.models.require_scan`` is True (the default) and modelscan is
-    not installed, this is now a hard failure instead of a silent skip.
+    Validated GGUF/safetensors are explicitly nonapplicable. All applicable
+    inputs require complete evidence even under a legacy optional-scan policy.
     """
     if policy is None:
         policy = {}
-    require_scan = policy.get("models", {}).get("require_scan", True)
+    try:
+        require_scan = policy.get("models", {}).get("require_scan", True)
+    except (TypeError, AttributeError):
+        require_scan = None
     if not isinstance(require_scan, bool):
-        return _external_scanner_result(
-            passed=False,
-            scanner="modelscan",
+        return _static_scanner_result(
+            "error", "modelscan",
             reason="models.require_scan policy is invalid",
         )
 
+    applicability = _static_applicability(artifact_path, "modelscan")
+    if applicability is not None:
+        return applicability
     try:
         from modelscan.modelscan import ModelScan
-
-        scanner = ModelScan()
-        results = scanner.scan(str(artifact_path))
-        return _validated_modelscan_result(
-            results, artifact_path, "modelscan-api"
-        )
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"modelscan", "modelscan.modelscan"}:
+            return _static_scanner_result(
+                "error", "modelscan-api", reason="installed ModelScan dependency is missing"
+            )
     except ImportError:
-        pass
-    except Exception as e:
-        log.warning("modelscan API error: %s", e)
+        return _static_scanner_result(
+            "error", "modelscan-api", reason="installed ModelScan API cannot be imported"
+        )
+    else:
+        try:
+            return _validated_modelscan_result(ModelScan().scan(str(artifact_path)), artifact_path, "modelscan-api")
+        except Exception as exc:
+            return _static_scanner_result(
+                "error", "modelscan-api", reason=f"modelscan API error: {type(exc).__name__}"
+            )
 
     try:
         with tempfile.TemporaryDirectory(prefix="secai-modelscan-") as temp_dir:
@@ -2172,51 +2308,34 @@ def _run_modelscan(artifact_path: Path, policy: dict | None = None) -> dict:
                         return validated
                     if not validated["passed"]:
                         return validated
-                    return _external_scanner_result(
-                        passed=False,
-                        scanner="modelscan-cli",
+                    return _static_scanner_result(
+                        "error", "modelscan-cli",
                         reason="modelscan exit code contradicted its JSON verdict",
                     )
                 except (OSError, ValueError):
-                    return _external_scanner_result(
-                        passed=False,
-                        scanner="modelscan-cli",
+                    return _static_scanner_result(
+                        "error", "modelscan-cli",
                         reason=(
                             "modelscan returned invalid or incomplete JSON output"
                         ),
                     )
             log.warning("modelscan CLI exited %d", result.returncode)
-            return _external_scanner_result(
-                passed=False,
-                scanner="modelscan-cli",
-                reason=f"modelscan CLI error (exit {result.returncode})",
+            return _static_scanner_result(
+                "error", "modelscan-cli", reason=f"modelscan CLI error (exit {result.returncode})"
             )
     except FileNotFoundError:
-        if require_scan:
-            log.warning("modelscan not installed; scan is required by policy — failing")
-            return _external_scanner_result(
-                passed=False,
-                available=False,
-                scanner="modelscan",
-                reason="static scanner required but not installed",
-            )
-        log.warning("modelscan not installed; skipping static scan (not required by policy)")
-        return _external_scanner_result(
-            passed=True,
-            available=False,
-            scanner="modelscan",
-            note="modelscan not installed, skipped",
+        return _static_scanner_result(
+            "unavailable", "modelscan", reason="static scanner required but not installed"
         )
     except subprocess.TimeoutExpired:
         log.warning("modelscan timed out after 300s")
-        return _external_scanner_result(
-            passed=False, scanner="modelscan", reason="modelscan timed out"
+        return _static_scanner_result(
+            "error", "modelscan", reason="modelscan timed out"
         )
     except Exception as e:
         log.warning("modelscan CLI error: %s", e)
-        return _external_scanner_result(
-            passed=False,
-            scanner="modelscan",
+        return _static_scanner_result(
+            "error", "modelscan",
             reason=f"modelscan error: {type(e).__name__}",
         )
 
@@ -2261,14 +2380,22 @@ def _check_file_entropy(artifact_path: Path) -> dict:
         return {"passed": False, "reason": f"entropy check failed: {e}"}
 
 
+STATIC_DIRECTORY_REPORT_MAX_BYTES = 512 * 1024
+
+
 def check_static_scan_directory(artifact_dir: Path, policy: dict | None = None) -> dict:
     """Stage 5 (directory variant): Scan all safetensors files in a diffusion model."""
     if policy is None:
         policy = {}
     issues = []
     scanned = 0
+    outcomes = {}
+    report_bytes = 0
 
     try:
+        format_result = check_format_gate_directory(artifact_dir)
+        if format_result.get("passed") is not True:
+            return {"passed": False, "reason": format_result.get("reason", "invalid directory"), "scanned": 0}
         safetensors_files = [
             path
             for path in inspect_directory_files(artifact_dir)
@@ -2280,6 +2407,12 @@ def check_static_scan_directory(artifact_dir: Path, policy: dict | None = None) 
     for p in safetensors_files:
         result = check_static_scan(p, policy=policy)
         scanned += 1
+        relative_name = str(p.relative_to(artifact_dir))
+        report_bytes += len(json.dumps({relative_name: result}, ensure_ascii=True).encode("utf-8"))
+        if report_bytes > STATIC_DIRECTORY_REPORT_MAX_BYTES:
+            return {"passed": False, "reason": "directory static evidence exceeds safety limit",
+                    "scanned": scanned, "files": outcomes}
+        outcomes[relative_name] = result
         if not result["passed"]:
             issues.append({"file": str(p.relative_to(artifact_dir)), "reason": result.get("reason", "unknown")})
 
@@ -2289,10 +2422,11 @@ def check_static_scan_directory(artifact_dir: Path, policy: dict | None = None) 
             "reason": f"static scan found issues in {len(issues)} file(s)",
             "issues": issues,
             "scanned": scanned,
+            "files": outcomes,
         }
     if scanned == 0:
         return {"passed": False, "reason": "no safetensors files to scan", "scanned": 0}
-    return {"passed": True, "scanned": scanned}
+    return {"passed": True, "scanned": scanned, "files": outcomes}
 
 
 # ---------------------------------------------------------------------------
@@ -3078,15 +3212,26 @@ def check_diffusion_config_integrity(artifact_dir: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def run_pipeline(artifact_path: Path, file_hash: str, policy: dict,
-                 source_url: str = "") -> dict:
+                 source_url: str = "", *, policy_context: PolicyContext | None = None,
+                 runner=None) -> dict:
     """Run all pipeline stages on a single-file artifact (LLM model).
     Returns aggregate result dict.
     """
+    if policy_context is not None:
+        # Every policy consumer in this scan reads the same immutable bytes.
+        # The legacy dict remains supported for callers outside helper v2.
+        policy = policy_context.document("policy.yaml")
+    context_args = {} if policy_context is None else {"policy_context": policy_context}
     details = {}
     model_policy = policy.get("models", {})
+    runner_args = {} if runner is None else {"runner": runner}
+    if runner is not None and artifact_path.suffix.lower() == ".gguf" and model_policy.get("require_behavior_tests", True):
+        # The initial bounded helper profile cannot start a model-serving
+        # network/GPU runtime. A trusted requirement is never treated as a skip.
+        return {"passed": False, "reason": "bounded_behavior_runtime_unavailable", "details": details}
 
     # Stage 1: Source policy
-    src = check_source_policy(source_url, policy=policy)
+    src = check_source_policy(source_url, policy=policy, **context_args)
     details["source_policy"] = src
     if not src["passed"]:
         return {"passed": False, "reason": "source_policy", "details": details}
@@ -3099,7 +3244,7 @@ def run_pipeline(artifact_path: Path, file_hash: str, policy: dict,
 
     # Stage 3: Integrity (hash pinning)
     pin = check_hash_pin(
-        artifact_path.name, file_hash, source_url=source_url, policy=policy
+        artifact_path.name, file_hash, source_url=source_url, policy=policy, **context_args
     )
     details["hash_pin"] = pin
     details["hash"] = {"sha256": file_hash}
@@ -3107,13 +3252,13 @@ def run_pipeline(artifact_path: Path, file_hash: str, policy: dict,
         return {"passed": False, "reason": "hash_mismatch", "details": details}
 
     # Stage 4: Provenance
-    prov = check_provenance(artifact_path, source_url)
+    prov = check_provenance(artifact_path, source_url, **runner_args)
     details["provenance"] = prov
     if not prov["passed"]:
         return {"passed": False, "reason": "provenance", "details": details}
 
     # Stage 5: Static scan
-    scan = check_static_scan(artifact_path, policy=policy)
+    scan = check_static_scan(artifact_path, policy=policy, **runner_args)
     details["static_scan"] = scan
     if not scan["passed"]:
         return {"passed": False, "reason": "static_scan", "details": details}
@@ -3133,13 +3278,13 @@ def run_pipeline(artifact_path: Path, file_hash: str, policy: dict,
     # Post-scan: generate gguf-guard artifacts for promotion metadata
     if artifact_path.suffix.lower() == ".gguf":
         # Structural fingerprint (stored in promotion metadata)
-        fp = _run_gguf_guard_fingerprint(artifact_path)
+        fp = _run_gguf_guard_fingerprint(artifact_path, **runner_args)
         if fp:
             details["gguf_guard_fingerprint"] = fp
 
         # Per-tensor integrity manifest (stored alongside model in registry)
         manifest_path = artifact_path.with_suffix(".gguf.manifest.json")
-        manifest_result = _run_gguf_guard_manifest(artifact_path, manifest_path)
+        manifest_result = _run_gguf_guard_manifest(artifact_path, manifest_path, **runner_args)
         details["gguf_guard_manifest"] = manifest_result
 
     return {"passed": True, "reason": "all_checks_passed", "details": details}

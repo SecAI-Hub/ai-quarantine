@@ -405,22 +405,18 @@ class TestProvenance:
 # ---------------------------------------------------------------------------
 
 class TestStaticScan:
-    def test_fails_when_not_installed_and_required(self, tmp_path):
-        """When require_scan is True (default), missing modelscan is a hard failure."""
-        p = make_gguf_file(tmp_path)
-        result = check_static_scan(p)
+    def test_fails_when_applicable_scanner_is_missing(self, tmp_path, monkeypatch):
+        """Unsupported ModelScan differs from a missing required format gate."""
+        monkeypatch.setattr(pipeline_module, "MODELAUDIT_BIN", str(tmp_path / "absent"))
+        result = check_static_scan(make_gguf_file(tmp_path))
         assert not result["passed"]
-        assert "required but not installed" in result["details"]["modelscan"]["reason"]
+        assert result["details"]["modelscan"]["verdict"] == "not_applicable"
+        assert result["details"]["modelaudit"]["verdict"] == "unavailable"
 
-    def test_skipped_when_not_installed_and_not_required(self, tmp_path):
-        """When require_scan is False, missing modelscan is acceptable."""
-        p = make_gguf_file(tmp_path)
-        policy = {
-            "models": {"require_scan": False},
-            "quarantine": {"scanner_missing": "warn-and-skip"},
-        }
-        result = check_static_scan(p, policy=policy)
-        assert result["passed"]
+    def test_missing_applicable_scan_cannot_be_disabled(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "MODELAUDIT_BIN", str(tmp_path / "absent"))
+        policy = {"models": {"require_scan": False}, "quarantine": {"scanner_missing": "warn-and-skip"}}
+        assert not check_static_scan(make_gguf_file(tmp_path), policy=policy)["passed"]
 
     def test_missing_passed_field_cannot_default_to_clean(self, tmp_path, monkeypatch):
         path = make_gguf_file(tmp_path)
@@ -615,15 +611,17 @@ class TestDirectoryHash:
 # ---------------------------------------------------------------------------
 
 class TestRunPipeline:
-    def test_valid_gguf_passes(self, tmp_path):
+    def test_valid_gguf_requires_applicable_scanners(self, tmp_path, monkeypatch):
         p = make_gguf_file(tmp_path)
         h = "a" * 64
         policy = {
             "models": {"require_scan": False, "require_behavior_tests": False},
             "quarantine": {"scanner_missing": "warn-and-skip"},
         }
+        monkeypatch.setattr(pipeline_module, "MODELAUDIT_BIN", str(tmp_path / "absent"))
         result = run_pipeline(p, h, policy)
-        assert result["passed"]
+        assert not result["passed"]
+        assert result["reason"] == "static_scan"
         assert "source_policy" in result["details"]
         assert "format_gate" in result["details"]
         assert "provenance" in result["details"]
@@ -637,16 +635,17 @@ class TestRunPipeline:
 
 
 class TestRunPipelineDirectory:
-    def test_valid_diffusion_passes(self, tmp_path):
+    def test_valid_diffusion_requires_applicable_scanners(self, tmp_path, monkeypatch):
         d = make_diffusion_dir(tmp_path)
         h = sha256_of_directory(d)
         policy = {
             "models": {"require_scan": False},
             "quarantine": {"scanner_missing": "warn-and-skip"},
         }
+        monkeypatch.setattr(pipeline_module, "MODELAUDIT_BIN", str(tmp_path / "absent"))
         result = run_pipeline_directory(d, h, policy)
-        assert result["passed"]
-        assert "diffusion_deep_scan" in result["details"]
+        assert not result["passed"]
+        assert result["reason"] == "static_scan"
 
     def test_diffusion_with_pickle_fails(self, tmp_path):
         d = make_diffusion_dir(tmp_path, "bad-diff")
@@ -786,38 +785,41 @@ class TestPicklePolyglot:
 
 class TestFicklingGraceful:
     def test_fickling_not_installed(self, tmp_path):
-        """Graceful skip when fickling is not installed."""
+        """Validated GGUF is not positive Fickling scan evidence."""
         p = make_gguf_file(tmp_path)
         result = _run_fickling_scan(p)
-        assert result["passed"]
-        assert "not installed" in result.get("note", "")
+        assert not result["passed"]
+        assert result["verdict"] == "not_applicable"
+        assert result["scanned_count"] == 0
 
-    def test_fickling_requires_explicit_safe_boolean(self, tmp_path, monkeypatch):
-        path = make_gguf_file(tmp_path)
-        monkeypatch.setattr(
-            pipeline_module.subprocess,
-            "run",
-            lambda *_args, **_kwargs: SimpleNamespace(
-                returncode=0, stdout='{"issues": []}', stderr=""
-            ),
-        )
+    def test_fickling_rejects_unknown_report_schema(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "_scanner_cli_version", lambda *_a: "0.1.12")
+        path = tmp_path / "safe.pkl"
+        path.write_bytes(b"N.")
+        def incomplete_report(args, **_kwargs):
+            Path(args[args.index("--json-output") + 1]).write_text('{"issues": []}')
+            return SimpleNamespace(returncode=0)
+
+        monkeypatch.setattr(pipeline_module.subprocess, "run", incomplete_report)
 
         result = _run_fickling_scan(path)
 
         assert result["passed"] is False
-        assert result["schema_version"] == 1
-        assert result["verdict"] == "fail"
+        assert result["schema_version"] == 2
+        assert result["verdict"] == "error"
 
 
 class TestModelAuditGraceful:
-    def test_modelaudit_not_installed(self, tmp_path):
-        """Graceful skip when modelaudit is not installed."""
+    def test_modelaudit_not_installed(self, tmp_path, monkeypatch):
+        """A missing applicable scanner remains nonpassing."""
+        monkeypatch.setattr(pipeline_module, "MODELAUDIT_BIN", str(tmp_path / "absent"))
         p = make_gguf_file(tmp_path)
         result = _run_modelaudit(p)
-        assert result["passed"]
-        assert "not installed" in result.get("note", "")
+        assert not result["passed"]
+        assert result["verdict"] == "unavailable"
 
     def test_modelaudit_missing_issues_is_not_clean(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(pipeline_module, "_scanner_cli_version", lambda *_a: "0.2.52")
         path = make_gguf_file(tmp_path)
         monkeypatch.setattr(
             pipeline_module.subprocess,
@@ -830,7 +832,7 @@ class TestModelAuditGraceful:
         result = _run_modelaudit(path)
 
         assert result["passed"] is False
-        assert result["verdict"] == "fail"
+        assert result["verdict"] == "error"
 
 
 class TestModelScanReportSchema:
@@ -1465,13 +1467,13 @@ class TestGarakIntegration:
 
 class TestGGUFGuardIntegration:
     def test_scan_not_installed_graceful(self, tmp_path):
-        """Graceful skip when gguf-guard is not installed."""
+        """A missing applicable guard remains nonpassing."""
         p = make_gguf_file(tmp_path)
         # Use a nonexistent binary path to simulate not installed
         with patch("quarantine.pipeline.GGUF_GUARD_BIN", "/nonexistent/gguf-guard"):
             result = _run_gguf_guard_scan(p)
-        assert result["passed"]
-        assert "not installed" in result.get("note", "")
+        assert not result["passed"]
+        assert result["verdict"] == "unavailable"
 
     def test_scan_not_installed_required_fails(self, tmp_path):
         """When required=True and not installed, scan fails."""
@@ -1483,11 +1485,10 @@ class TestGGUFGuardIntegration:
 
     def test_scan_skips_non_gguf(self, tmp_path):
         """Non-GGUF files are skipped."""
-        p = tmp_path / "model.safetensors"
-        p.write_bytes(b"\x00" * 100)
+        p = make_safetensors_file(tmp_path, "model.safetensors")
         result = _run_gguf_guard_scan(p)
-        assert result["passed"]
-        assert "not a GGUF file" in result.get("note", "")
+        assert not result["passed"]
+        assert result["verdict"] == "not_applicable"
 
     def test_scan_returns_scanner_name(self, tmp_path):
         """Result always includes scanner identifier."""

@@ -32,7 +32,7 @@ that its outputs are generally safe.
 | Symlink, hard-link, FIFO/device, or replacement race | Descriptor-relative/no-follow single-link regular-file opens, special-file rejection, bounded link-free traversal, metadata revalidation, and pre/post-move hashes. |
 | Unpinned remote artifact | Remote artifacts require both an allowlisted source and exact SHA-256 pin. |
 | Untrusted local TOFU | Production policy disables local imports and requires pins; development may opt in. |
-| Scanner missing/crash/timeout/partial report | Versioned explicit scanner verdicts; ModelScan requires zero errors/skips and positive expected coverage; every behavioral prompt and a nonzero bounded Garak report are required; production scanner mode fails closed. |
+| Scanner missing/crash/timeout/partial report | Static schema-v2 verdicts distinguish pass/fail/not_applicable/unavailable/error; only validated formats can exempt an inapplicable parser, with zero coverage and passed=false. Applicable scanners require positive complete evidence; errors cannot become exemptions. Every behavioral prompt and a nonzero bounded Garak report remain required. |
 | Scanner/runtime escape | Deployment must use a separate disposable worker with no egress, minimal read-only mounts, seccomp/namespaces or microVM isolation, and no secrets. |
 | Unauthorized registry promotion | Mandatory bearer token by default; secure credential files; non-loopback plaintext HTTP rejected. |
 | Partial promotion or trusted-name overwrite | Existing names are never overwritten; a durable pre-move marker enables rollback of incomplete staging; artifact, provenance, signatures, guard evidence, payload, and journal are hashed/fsynced/reverified before an idempotent API commit; fully staged failures replay from the pending journal. |
@@ -60,6 +60,17 @@ that its outputs are generally safe.
 
 ## Residual risk
 
+- Scanner applicability is not a complete admission compatibility proof.
+  ModelAudit 0.2.52 and Fickling 0.1.12 identify the invoked tool version
+  separately from their report schemas. Only the verified safe classification
+  and complete applicable evidence can pass; no cache/whitelist downgrade or
+  weaker report fallback is used. Unknown versions and incomplete/stacked
+  unsupported reports remain nonpassing. Safe pickle tests do not authorize
+  pickle admission. GGUF header coverage is not whole-tensor inspection;
+  independent weight and gguf-guard gates remain required.
+- Helper registry wire/lifecycle/idempotency compatibility remains unresolved;
+  the deployment assumptions above are requirements, not implemented guarantees
+  provided by the sibling registry.
 - Novel scanner evasions, poisoned but correctly signed upstream models, and
   subtle weight-level backdoors remain possible.
 - Native parser and model-runtime zero-days remain a high-impact risk.

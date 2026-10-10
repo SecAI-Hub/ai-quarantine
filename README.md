@@ -7,6 +7,22 @@ then performs an authenticated idempotent registry commit. Registry consumers
 must treat only committed API/database records as trusted; filesystem presence
 alone is never an admission verdict.
 
+For the standalone helper admission v2 client, provision its registry-admission
+credential with the registry's `promote` scope. `AdmissionClient` uses that one
+credential for capability preflight, prepare, commit and exact single-model
+receipt lookup; it does not require the administrator credential. Read and
+verify credentials cannot admit artifacts. Legacy unscoped deployments retain
+their shared service key; that mode provides no scoped authority separation.
+
+The watcher selects its path with `QUARANTINE_ADMISSION_MODE`: `legacy` is the
+default, and `helper-v2-required` selects the v2 controller. Unknown values are
+refused. The v2 path is currently unavailable: its public entry points refuse
+before parsing, creating journals, copying artifacts or preparing registry
+transactions because the required sandbox probes are not yet implemented and
+qualified. No flag or receipt file can bypass that boundary. Source tests cover
+the controller's exact request replay and retained transaction state; they do
+not establish operational scanner isolation or enable deployment.
+
 ## Security properties
 
 The core pipeline performs seven ordered gates:
@@ -79,17 +95,18 @@ result = run_pipeline(
     file_hash="expected-sha256",
     policy={
         "models": {
-            "require_scan": False,
+            "require_scan": True,
             "require_behavior_tests": False,
             "allow_local_imports": True,
         },
-        "quarantine": {"scanner_missing": "warn-and-skip"},
+        "quarantine": {"scanner_missing": "fail-closed"},
     },
 )
 print(result["passed"], result["details"])
 ```
 
-The permissive settings above are for development only.
+Local imports and disabled behavioral testing above are for development only.
+Applicable static gates still require complete evidence.
 
 ## Production prerequisites
 
@@ -177,12 +194,12 @@ contains only the core Python dependency.
 | Key | Meaning |
 |---|---|
 | `models.allowed_formats` | Subset of `gguf` and `safetensors` |
-| `models.require_scan` | Require ModelScan |
+| `models.require_scan` | Static scan requirement; false cannot waive applicable evidence |
 | `models.require_behavior_tests` | Require llama-server behavioral checks |
 | `models.allow_local_imports` | Permit artifacts without source metadata |
 | `models.require_hash_pin_for_local` | Reject unpinned local artifacts |
 | `models.allow_diffusion_directories` | Permit directory artifacts |
-| `quarantine.scanner_missing` | `fail-closed` or `warn-and-skip` |
+| `quarantine.scanner_missing` | `fail-closed` or legacy `warn-and-skip`; neither waives applicable static evidence |
 | `quarantine.smoke_test_max_score` | Maximum behavioral flag ratio |
 | `quarantine.smoke_test_max_critical` | Maximum critical-category flags |
 | `gguf_guard.required` | Require gguf-guard for GGUF artifacts |
@@ -199,12 +216,62 @@ llama-server, cosign, and fs-verity. Scanner processes handle hostile data and
 must be treated as an untrusted parsing tier. The production profile fails
 closed on missing static and behavioral scanners.
 
+Static scanner outcomes use schema version 2 with `verdict`, `passed`,
+`available`, `scanner`, `scanner_version`, `reason`, and `scanned_count`.
+The verdict is `pass`, `fail`, `not_applicable`, `unavailable`, or `error`.
+Only `pass` sets `passed=true`. Nonapplicable outcomes have zero coverage,
+no observed scanner version, and unknown availability; they never claim the
+scanner ran. Aggregation separately accepts an expected nonapplicable gate
+only after validating the artifact format. Unknown/corrupt formats, symlinks,
+and unexpected directory files cannot obtain that exemption.
+
+| Scanner | Validated GGUF | Validated safetensors |
+|---|---|---|
+| ModelScan | Not applicable | Not applicable |
+| Fickling | Not applicable | Not applicable |
+| ModelAudit | Required | Required |
+| gguf-guard | Required | Not applicable |
+
+Header/format, pickle-polyglot, entropy and weight checks remain required.
+Weight analysis must cover at least one tensor; unsupported numerical types
+or files too small for meaningful statistics cannot silently pass this gate.
+Directory scanning validates the inventory first and retains each safetensors
+file's detailed outcomes within a 512 KiB static-evidence budget; overflow is
+nonpassing. Its file count is not ModelScan coverage. Existing source, pinning,
+provenance and behavioral gates remain separate.
+
 External results are not accepted merely because a process exits zero.
-ModelScan must report a version, zero errors/skips, positive coverage of the
-requested artifact, and an explicit empty issue set. Fickling must provide an
-explicit boolean safety verdict, and ModelAudit must provide a versioned issue
-list. Garak must produce one bounded JSONL report with at least one evaluated
-probe. Missing, contradictory, malformed, empty, or partial reports fail.
+For applicable library inputs, ModelScan requires a version, zero errors/skips,
+positive expected coverage and no issues. An installed broken API cannot fall
+back to CLI. Fickling 0.1.12 must report `LIKELY_SAFE`, no contradictory
+findings, and the matching successful exit; its JSON report is written to a
+private temporary file, separate from the input. ModelAudit 0.2.52 must report
+successful completion, the exact requested file and applicable format scanner,
+positive file/byte/check coverage, and no unsafe or incomplete evidence.
+The invoked ModelAudit and Fickling executables identify their versions through
+`--version` with a five-second timeout; adapter schema numbers are separate.
+ModelAudit scans disable result-cache reuse and whitelist severity downgrading.
+ModelAudit's GGUF byte coverage can describe parsed headers rather than all
+tensor bytes; `bytes_scanned` and `artifact_size_bytes` remain distinct, with
+independent format, weight and guard checks still required. gguf-guard must
+return its completed PASS/WARN/FAIL output consistently with its exit status
+and identify its version. Existing guard warning thresholds are preserved.
+Missing, contradictory, malformed, empty or partial applicable reports fail,
+even with legacy `require_scan=false` or `scanner_missing=warn-and-skip`.
+These settings remain accepted for configuration compatibility but cannot
+create static scan evidence. Other development policy behavior is unchanged.
+
+Qualified contracts currently cover ModelAudit 0.2.52, Fickling 0.1.12 and
+gguf-guard 0.2.0; unknown versions fail closed until their report contracts are
+qualified. ModelScan 0.8.8 has API and CLI fixture coverage. Real synthetic GGUF,
+safetensors and directory static-stage checks exercise the applicable scanners,
+while safe/unsafe/invalid pickle controls exercise library adapters only. The
+production allowlist still rejects pickle. Fickling reports containing multiple
+stacked JSON documents and ModelAudit reports with incomplete or inconsistent
+check inventories remain nonpassing. These checks do not qualify behavioral
+inference, all model families, production deployment or registry promotion.
+
+Garak must produce one bounded JSONL report with at least one evaluated probe.
 
 Every configured behavioral prompt must return one bounded, non-empty,
 schema-valid response. Timeouts, transport errors, malformed JSON, oversized
@@ -255,9 +322,11 @@ bundle; unsigned local provenance remains metadata, not non-repudiation.
   files and the API to honor idempotency keys; a server-owned staging/commit
   API would reduce this residual coupling.
 - Hash-chain HMAC checkpoints do not replace remote/WORM log replication.
-- All ModelScan integrations must reject errors, skipped artifacts, and zero
-  coverage; a scanner that does not support the admitted format is not evidence
-  of a clean artifact.
+- Applicable ModelScan integrations reject errors, skips and zero coverage.
+  Unsupported scanners remain explicit nonapplicable outcomes, not evidence
+  of a clean artifact. Helper promotion protocol compatibility remains separate
+  from scanner applicability; the sibling registry does not yet implement the
+  watcher's stated idempotent commit contract.
 - Multi-process audit writers are unsupported.
 
 See [SECURITY_AUDIT.md](SECURITY_AUDIT.md) for the audit record, completed

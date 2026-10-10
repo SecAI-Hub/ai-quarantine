@@ -67,6 +67,23 @@ RETRY_BASE_SECONDS = 5
 RETRY_MAX_SECONDS = 300
 
 
+def _v2_selected() -> bool:
+    mode = os.getenv("QUARANTINE_ADMISSION_MODE", "legacy")
+    if mode not in {"legacy", "helper-v2-required"}:
+        raise ValueError("unknown quarantine admission mode; no fallback")
+    return mode == "helper-v2-required"
+
+
+def _legacy_only() -> None:
+    if _v2_selected():
+        from quarantine.admission_controller import (
+            RuntimeUnavailable,
+            require_qualified_runtime,
+        )
+        require_qualified_runtime()  # Before any legacy state/configuration work.
+        raise RuntimeUnavailable("legacy watcher actions are forbidden in helper-v2-required mode")
+
+
 class _NoRedirects(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -692,6 +709,7 @@ def promote_to_registry(filename: str, file_hash: str, size_bytes: int,
                         evidence: list[dict] | None = None,
                         payload_override: dict | None = None) -> bool:
     """Idempotently commit a fully staged promotion bundle to the registry."""
+    _legacy_only()
     try:
         filename = _validate_artifact_name(filename)
         registry_base = _validated_registry_base_url()
@@ -818,7 +836,10 @@ def _source_log_label(source_url: str) -> str:
 
 
 def process_artifact(artifact_path: Path) -> bool:
-    """Run the full pipeline on a single-file artifact. Returns True if promoted."""
+    """Run the explicitly selected admission path; v2 has no legacy fallback."""
+    if _v2_selected():
+        from quarantine.admission_controller import process_artifact as process_v2
+        return process_v2(artifact_path)
     _validate_artifact_name(artifact_path.name)
     initial_identity = _artifact_identity(artifact_path)
     log.info("processing: %s", artifact_path.name)
@@ -975,6 +996,7 @@ def process_directory(artifact_dir: Path) -> bool:
     """Run the full pipeline on a multi-file diffusion model directory.
     Returns True if promoted.
     """
+    _legacy_only()
     _validate_artifact_name(artifact_dir.name)
     artifact_files = inspect_directory_files(artifact_dir)
     log.info("processing directory: %s", artifact_dir.name)
@@ -1418,6 +1440,7 @@ def _recover_incomplete_staging(record: dict, path: Path) -> None:
 
 def recover_pending_promotions(*, now: float | None = None) -> int:
     """Replay a bounded number of fully staged, idempotent registry commits."""
+    _legacy_only()
     current_time = time.time() if now is None else now
     journal_dir = _promotion_journal_dir()
     committed = 0
@@ -1715,6 +1738,7 @@ def _dispatch_queue_entry(entry: Path, metadata: os.stat_result) -> str:
 
 def scan_directory(*, now: float | None = None) -> int:
     """Process a bounded queue batch with claims and persistent retry state."""
+    _legacy_only()
     if not QUARANTINE_DIR.exists():
         return 0
     current_time = time.time() if now is None else now
@@ -1833,6 +1857,7 @@ def _validate_startup_configuration() -> None:
 
 
 def main():
+    _legacy_only()  # Required before mkdir, policy loading or old journal recovery.
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
